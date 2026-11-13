@@ -1,0 +1,12 @@
+name: Runner Queue Check
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        default: "ubuntu-latest"
+        required: true
+jobs:
+  ping:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - run: uname -a && sw_vers || true
