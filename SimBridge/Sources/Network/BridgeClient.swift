@@ -188,10 +188,14 @@ final class BridgeClient: ObservableObject {
     private var bonjourBrowser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
     private var foregroundObserver: NSObjectProtocol?
+    private let discoveryQueue = DispatchQueue(label: "com.simbridge.discovery", qos: .utility)
 
     private var cachedVoipToken: String?
     private var cachedAlertToken: String?
     private var isConnecting = false
+    private var lastLanSignature: String = LanDiscovery.currentLanSignature()
+    private var retryAttemptCount = 0
+    private var lastAttemptedIps: Set<String> = []
     private var reconnectTask: Task<Void, Never>?
     private var retryTask: Task<Void, Never>?
     private var keepaliveTimer: Task<Void, Never>?
@@ -251,6 +255,10 @@ final class BridgeClient: ObservableObject {
 
     func unpair() {
         disconnect()
+        bonjourBrowser?.cancel()
+        bonjourBrowser = nil
+        retryAttemptCount = 0
+        lastAttemptedIps = []
         PairingStore.shared.clear()
         isPaired = false
         isConnected = false
@@ -270,32 +278,51 @@ final class BridgeClient: ObservableObject {
         }
     }
 
-    func connectNow(candidateIps: [String]? = nil, wsPort: Int? = nil, udpPort: Int? = nil, force: Bool = false) {
+    func connectNow(
+        candidateIps: [String]? = nil,
+        wsPort: Int? = nil,
+        udpPort: Int? = nil,
+        force: Bool = false,
+        sweepSubnet: Bool = false
+    ) {
+        if candidateIps != nil || wsPort != nil || udpPort != nil {
+            PairingStore.shared.updateIps(candidateIps ?? [], wsPort: wsPort, udpPort: udpPort)
+        }
         guard let stored = PairingStore.shared.load(),
               let key = BridgeCrypto.decodeBase64Url(stored.keyB64) else {
             return
         }
-        if let candidateIps {
-            PairingStore.shared.updateIps(candidateIps)
-        }
-        if !force && (isConnected || isConnecting) {
+
+        let freshIps = (candidateIps ?? []).filter { !$0.isEmpty }
+        let hostMismatch = isConnected && !freshIps.isEmpty && !freshIps.contains(connectedHost ?? "")
+        let hasUnseenCandidate = freshIps.contains { !lastAttemptedIps.contains($0) }
+        if !force && !hostMismatch && (isConnected || (isConnecting && !hasUnseenCandidate)) {
             return
         }
 
         var ips: [String] = []
-        if let last = stored.lastWorkingIp { ips.append(last) }
-        for ip in (candidateIps ?? []) where !ips.contains(ip) { ips.append(ip) }
-        for ip in stored.candidateIps where !ips.contains(ip) { ips.append(ip) }
+        for ip in (candidateIps ?? []) where !ip.isEmpty && !ips.contains(ip) { ips.append(ip) }
+        if let last = stored.lastWorkingIp, !last.isEmpty, !ips.contains(last) { ips.append(last) }
+        for ip in stored.candidateIps where !ip.isEmpty && !ips.contains(ip) { ips.append(ip) }
 
-        guard !ips.isEmpty else { return }
-        let targetWsPort = wsPort ?? stored.wsPort
+        let targetWsPort = (wsPort ?? 0) > 0 ? (wsPort ?? stored.wsPort) : stored.wsPort
+        let targetUdpPort = (udpPort ?? 0) > 0 ? (udpPort ?? stored.udpPort) : stored.udpPort
+        let shouldSweep = sweepSubnet || retryAttemptCount >= 1
+        lastAttemptedIps = Set(ips)
 
         reconnectTask?.cancel()
         isConnecting = true
         reconnectTask = Task { [weak self] in
             guard let self else { return }
             defer { self.isConnecting = false }
-            await self.raceAndConnect(ips: ips, wsPort: targetWsPort, key: key)
+            await self.raceAndConnect(
+                ips: ips,
+                wsPort: targetWsPort,
+                udpPort: targetUdpPort,
+                bridgeId: stored.bridgeId,
+                key: key,
+                sweepSubnet: shouldSweep
+            )
         }
     }
 
@@ -326,7 +353,9 @@ final class BridgeClient: ObservableObject {
     func handleAppBecameActive() {
         guard isPaired else { return }
         if !isConnected {
-            connectNow()
+            retryAttemptCount = 0
+            startDiscovery()
+            connectNow(force: true, sweepSubnet: true)
             return
         }
         guard let task = wsTask else {
@@ -452,10 +481,39 @@ final class BridgeClient: ObservableObject {
         )
     }
 
-    private func connectWithTimeout(
+    private struct ConnectOutcome: @unchecked Sendable {
+        let ip: String
+        let wsPort: Int
+        let task: URLSessionWebSocketTask
+        let firstMsg: URLSessionWebSocketTask.Message
+    }
+
+    private final class OnceFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fired = false
+
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if fired { return false }
+            fired = true
+            return true
+        }
+    }
+
+    nonisolated private static func extractIpv4(_ host: NWEndpoint.Host) -> String? {
+        let raw = "\(host)"
+            .components(separatedBy: "%")
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !raw.isEmpty, !raw.contains(":") else { return nil }
+        return raw
+    }
+
+    nonisolated private func connectWithTimeout(
         url: URL,
         helloEnvStr: String,
-        timeoutNs: UInt64 = 1_800_000_000
+        timeoutNs: UInt64 = 1_500_000_000
     ) async throws -> (URLSessionWebSocketTask, URLSessionWebSocketTask.Message) {
         var req = URLRequest(url: url)
         req.timeoutInterval = 2
@@ -484,7 +542,69 @@ final class BridgeClient: ObservableObject {
         }
     }
 
-    private func raceAndConnect(ips: [String], wsPort: Int, key: Data) async {
+    nonisolated private func raceWebSocket(
+        ips: [String],
+        wsPort: Int,
+        authToken: String,
+        helloEnvStr: String,
+        timeoutNs: UInt64
+    ) async -> ConnectOutcome? {
+        var uniqueIps: [String] = []
+        for ip in ips {
+            let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !clean.isEmpty && !uniqueIps.contains(clean) {
+                uniqueIps.append(clean)
+            }
+        }
+        guard !uniqueIps.isEmpty else { return nil }
+
+        return await withTaskGroup(of: ConnectOutcome?.self) { group in
+            for ip in uniqueIps.prefix(8) {
+                guard let url = URL(string: "ws://\(ip):\(wsPort)/ws?auth=\(authToken)") else { continue }
+                group.addTask { [self] in
+                    if Task.isCancelled { return nil }
+                    do {
+                        let (task, firstMsg) = try await self.connectWithTimeout(
+                            url: url,
+                            helloEnvStr: helloEnvStr,
+                            timeoutNs: timeoutNs
+                        )
+                        if Task.isCancelled {
+                            task.cancel(with: .goingAway, reason: nil)
+                            return nil
+                        }
+                        return ConnectOutcome(ip: ip, wsPort: wsPort, task: task, firstMsg: firstMsg)
+                    } catch {
+                        return nil
+                    }
+                }
+            }
+
+            var winner: ConnectOutcome?
+            for await outcome in group {
+                if let win = outcome {
+                    winner = win
+                    group.cancelAll()
+                    break
+                }
+            }
+            for await extra in group {
+                if let extra, extra.task !== winner?.task {
+                    extra.task.cancel(with: .goingAway, reason: nil)
+                }
+            }
+            return winner
+        }
+    }
+
+    private func raceAndConnect(
+        ips: [String],
+        wsPort: Int,
+        udpPort: Int,
+        bridgeId: String,
+        key: Data,
+        sweepSubnet: Bool
+    ) async {
         retryTask?.cancel()
         retryTask = nil
         let authToken = BridgeCrypto.deriveWsAuthToken(key: key)
@@ -506,37 +626,84 @@ final class BridgeClient: ObservableObject {
             return
         }
 
-        for ip in ips {
-            if Task.isCancelled { return }
-            guard let url = URL(string: "ws://\(ip):\(wsPort)/ws?auth=\(authToken)") else { continue }
-            do {
-                let (task, firstMsg) = try await connectWithTimeout(url: url, helloEnvStr: envStr)
-                if Task.isCancelled {
-                    task.cancel(with: .goingAway, reason: nil)
-                    return
+        let winner = await withTaskGroup(of: ConnectOutcome?.self) { group -> ConnectOutcome? in
+            if !ips.isEmpty {
+                group.addTask { [self] in
+                    await self.raceWebSocket(
+                        ips: ips,
+                        wsPort: wsPort,
+                        authToken: authToken,
+                        helloEnvStr: envStr,
+                        timeoutNs: 1_300_000_000
+                    )
                 }
-                self.wsTask = task
-                self.isConnected = true
-                self.connectedHost = ip
-                self.statusBanner = "Bağlı (\(ip))"
-                PairingStore.shared.updateIps([ip], lastWorkingIp: ip)
-                await self.handleWebSocketMessage(firstMsg, key: key)
-                self.listenLoop(task: task, key: key)
-                self.startKeepaliveLoop()
-                return
-            } catch {
-                // Continue rapidly to next candidate IP after 1.8s timeout.
             }
+            group.addTask { [self] in
+                let found = await LanDiscovery.probe(
+                    bridgeId: bridgeId,
+                    udpPort: udpPort,
+                    key: key,
+                    includeSubnetSweep: sweepSubnet
+                )
+                guard !Task.isCancelled, !found.ips.isEmpty else { return nil }
+                let targetWs = found.wsPort ?? wsPort
+                await MainActor.run {
+                    PairingStore.shared.updateIps(found.ips, wsPort: found.wsPort, udpPort: found.udpPort)
+                }
+                return await self.raceWebSocket(
+                    ips: found.ips,
+                    wsPort: targetWs,
+                    authToken: authToken,
+                    helloEnvStr: envStr,
+                    timeoutNs: 1_500_000_000
+                )
+            }
+
+            var picked: ConnectOutcome?
+            for await outcome in group {
+                if let win = outcome {
+                    picked = win
+                    group.cancelAll()
+                    break
+                }
+            }
+            for await extra in group {
+                if let extra, extra.task !== picked?.task {
+                    extra.task.cancel(with: .goingAway, reason: nil)
+                }
+            }
+            return picked
         }
+
+        if Task.isCancelled {
+            winner?.task.cancel(with: .goingAway, reason: nil)
+            return
+        }
+
+        if let win = winner {
+            self.retryAttemptCount = 0
+            self.wsTask = win.task
+            self.isConnected = true
+            self.connectedHost = win.ip
+            self.statusBanner = "Bağlı (\(win.ip))"
+            PairingStore.shared.updateIps([win.ip], lastWorkingIp: win.ip, wsPort: win.wsPort)
+            await self.handleWebSocketMessage(win.firstMsg, key: key)
+            self.listenLoop(task: win.task, key: key)
+            self.startKeepaliveLoop()
+            return
+        }
+
         isConnected = false
+        retryAttemptCount += 1
         statusBanner = "Android bekleniyor (yeniden deneniyor...)"
         scheduleAutoRetry()
     }
 
     private func scheduleAutoRetry() {
         retryTask?.cancel()
+        let delayNs: UInt64 = retryAttemptCount <= 3 ? 1_200_000_000 : 2_500_000_000
         retryTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            try? await Task.sleep(nanoseconds: delayNs)
             guard !Task.isCancelled, let self, self.isPaired, !self.isConnected, !self.isConnecting else {
                 return
             }
@@ -630,43 +797,130 @@ final class BridgeClient: ObservableObject {
 
     private func startDiscovery() {
         bonjourBrowser?.cancel()
-        let browser = NWBrowser(for: .bonjour(type: "_simbridge._tcp", domain: nil), using: .tcp)
+        let pairedBridgeId = PairingStore.shared.load()?.bridgeId
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_simbridge._tcp", domain: nil), using: .tcp)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self else { return }
             for r in results {
-                let resolver = NWConnection(to: r.endpoint, using: .tcp)
-                resolver.stateUpdateHandler = { state in
-                    if case .ready = state,
-                       let remote = resolver.currentPath?.remoteEndpoint,
-                       case .hostPort(let host, _) = remote {
-                        let ip = "\(host)".components(separatedBy: "%").first ?? ""
-                        if !ip.isEmpty && !ip.contains(":") {
-                            Task { @MainActor in
-                                PairingStore.shared.updateIps([ip])
-                                if self?.isConnected == false && self?.isConnecting == false {
-                                    self?.connectNow(candidateIps: [ip])
-                                }
-                            }
-                        }
+                var txtBridgeId: String?
+                if case .bonjour(let txt) = r.metadata,
+                   let entry = txt.getEntry(for: "bridgeId") {
+                    switch entry {
+                    case .string(let s): txtBridgeId = s
+                    case .data(let d): txtBridgeId = String(data: d, encoding: .utf8)
+                    default: break
                     }
-                    resolver.cancel()
                 }
-                resolver.start(queue: DispatchQueue.global(qos: .utility))
+                if let expectedId = pairedBridgeId {
+                    if let txtBridgeId, !txtBridgeId.isEmpty, txtBridgeId != expectedId {
+                        continue
+                    }
+                    if txtBridgeId == nil,
+                       case .service(let name, _, _, _) = r.endpoint,
+                       name.hasPrefix("SimBridge-"),
+                       !name.hasPrefix("SimBridge-\(expectedId.prefix(6))") {
+                        continue
+                    }
+                }
+                self.resolveBonjourEndpoint(r.endpoint)
             }
         }
-        browser.start(queue: DispatchQueue.global(qos: .utility))
+        browser.start(queue: discoveryQueue)
         bonjourBrowser = browser
     }
 
-    private func startNetworkMonitor() {
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { [weak self] path in
-            guard path.status == .satisfied else { return }
-            Task { @MainActor in
-                guard let self, self.isPaired, !self.isConnected, !self.isConnecting else { return }
-                self.connectNow()
+    nonisolated private func resolveBonjourEndpoint(_ endpoint: NWEndpoint) {
+        let resolver = NWConnection(to: endpoint, using: .tcp)
+        let once = OnceFlag()
+        let cleanup: @Sendable () -> Void = {
+            guard once.claim() else { return }
+            resolver.stateUpdateHandler = nil
+            resolver.cancel()
+        }
+        discoveryQueue.asyncAfter(deadline: .now() + .seconds(3)) {
+            cleanup()
+        }
+        resolver.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                if let remote = resolver.currentPath?.remoteEndpoint,
+                   case .hostPort(let host, let port) = remote,
+                   let ip = Self.extractIpv4(host) {
+                    let resolvedPort = Int(port.rawValue)
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isPaired else { return }
+                        let portArg = resolvedPort > 0 ? resolvedPort : nil
+                        PairingStore.shared.updateIps([ip], wsPort: portArg)
+                        if !self.isConnected {
+                            self.connectNow(candidateIps: [ip], wsPort: portArg, force: self.isConnecting)
+                        }
+                    }
+                }
+                cleanup()
+            case .failed, .cancelled:
+                cleanup()
+            default:
+                break
             }
         }
-        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        resolver.start(queue: discoveryQueue)
+    }
+
+    private func startNetworkMonitor() {
+        pathMonitor?.cancel()
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let isSatisfied = (path.status == .satisfied)
+            Task { @MainActor [weak self] in
+                guard let self, self.isPaired else { return }
+                let newSig = LanDiscovery.currentLanSignature()
+                let lanChanged = (newSig != self.lastLanSignature)
+                self.lastLanSignature = newSig
+
+                guard isSatisfied else { return }
+                if lanChanged {
+                    self.retryAttemptCount = 0
+                    self.startDiscovery()
+                    if self.isConnected {
+                        self.verifyConnectionOrReconnectOnNetworkChange()
+                    } else {
+                        self.connectNow(force: true)
+                    }
+                } else if !self.isConnected && !self.isConnecting {
+                    self.startDiscovery()
+                    self.connectNow()
+                }
+            }
+        }
+        monitor.start(queue: discoveryQueue)
         pathMonitor = monitor
+    }
+
+    private func verifyConnectionOrReconnectOnNetworkChange() {
+        guard let task = wsTask else {
+            isConnected = false
+            connectNow(force: true)
+            return
+        }
+        let once = OnceFlag()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard once.claim(), let self, self.wsTask === task else { return }
+            task.cancel(with: .goingAway, reason: nil)
+            self.wsTask = nil
+            self.isConnected = false
+            self.connectNow(force: true)
+        }
+        task.sendPing { [weak self] err in
+            Task { @MainActor [weak self] in
+                guard once.claim(), let self, self.wsTask === task else { return }
+                if err != nil {
+                    task.cancel(with: .goingAway, reason: nil)
+                    self.wsTask = nil
+                    self.isConnected = false
+                    self.connectNow(force: true)
+                }
+            }
+        }
     }
 }

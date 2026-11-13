@@ -107,3 +107,11 @@ struct BridgeWsMessage: Codable {
     var sinceMs: Int64? = nil
     var ts: Int64? = nil
 }
+
+struct LanDiscoveryPayload: Codable, Sendable {
+    let bridgeId: String
+    let deviceName: String
+    let ips: [String]
+    let wsPort: Int
+    let udpPort: Int
+}

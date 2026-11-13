@@ -5,6 +5,8 @@ enum UdpAudioPacket {
     static let magic: [UInt8] = [0x53, 0x42, 0x41, 0x32] // "SBA2"
     static let typeAudio: UInt8 = 1
     static let typeKeepalive: UInt8 = 2
+    static let typeDiscoverReq: UInt8 = 3
+    static let typeDiscoverResp: UInt8 = 4
     static let dirAndroidToIos: UInt8 = 1
     static let dirIosToAndroid: UInt8 = 2
 

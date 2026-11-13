@@ -49,14 +49,32 @@ final class PairingStore {
         return try? JSONDecoder().decode(StoredPairingConfig.self, from: data)
     }
 
-    func updateIps(_ ips: [String], lastWorkingIp: String? = nil) {
+    func updateIps(
+        _ ips: [String],
+        lastWorkingIp: String? = nil,
+        wsPort: Int? = nil,
+        udpPort: Int? = nil
+    ) {
         guard var cfg = load() else { return }
-        var merged = ips
+        let cleanNew = ips
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var merged: [String] = []
+        if let lw = lastWorkingIp?.trimmingCharacters(in: .whitespacesAndNewlines), !lw.isEmpty {
+            merged.append(lw)
+        }
+        for ip in cleanNew where !merged.contains(ip) {
+            merged.append(ip)
+        }
         for old in cfg.candidateIps where !merged.contains(old) {
             merged.append(old)
         }
-        cfg.candidateIps = merged
-        if let lastWorkingIp { cfg.lastWorkingIp = lastWorkingIp }
+        cfg.candidateIps = Array(merged.prefix(8))
+        if let lw = lastWorkingIp?.trimmingCharacters(in: .whitespacesAndNewlines), !lw.isEmpty {
+            cfg.lastWorkingIp = lw
+        }
+        if let wsPort, wsPort > 0 { cfg.wsPort = wsPort }
+        if let udpPort, udpPort > 0 { cfg.udpPort = udpPort }
         save(cfg)
     }
 

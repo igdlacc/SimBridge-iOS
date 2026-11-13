@@ -16,7 +16,7 @@ struct SettingsView: View {
                     if bridge.isPaired {
                         LabeledContent("Eşleşen Cihaz", value: bridge.pairingDeviceName)
                         Button("Şimdi Yeniden Bağlan") {
-                            bridge.connectNow(force: true)
+                            bridge.connectNow(force: true, sweepSubnet: true)
                         }
                     }
                     Button("QR Kod ile Eşleştir / Güncelle") {
