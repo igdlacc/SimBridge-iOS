@@ -18,8 +18,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Check XcodeGen and CMake
+        run: |
+          which xcodegen || brew install xcodegen
+          which cmake || brew install cmake
 
       - name: Build static libopus for arm64 iOS
         run: |
