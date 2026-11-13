@@ -12,14 +12,16 @@ on:
 
 jobs:
   build-ios:
-    runs-on: macos-latest
+    runs-on: macos-26-intel
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check XcodeGen and CMake
+      - name: Check XcodeGen, CMake and Xcode
         run: |
+          xcodebuild -version
+          xcrun --show-sdk-version --sdk iphoneos
           which xcodegen || brew install xcodegen
           which cmake || brew install cmake
 
@@ -33,6 +35,8 @@ jobs:
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
             -DOPUS_BUILD_SHARED_LIBRARY=OFF \
             -DOPUS_BUILD_TESTING=OFF \
             -DOPUS_BUILD_PROGRAMS=OFF \
