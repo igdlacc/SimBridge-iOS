@@ -5,10 +5,34 @@ struct RecentsView: View {
     @ObservedObject private var contacts = ContactsHelper.shared
     @State private var mode: Int = 0
     @State private var search: String = ""
+    @State private var selectedSimSlot: Int = 0
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 8) {
+                ConnectionStatusPill()
+
+                if let err = bridge.lastCallError {
+                    Text(err)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.red.opacity(0.9))
+                        .clipShape(Capsule())
+                        .padding(.horizontal)
+                }
+
+                if let sims = bridge.deviceStatus?.sims, sims.count > 1 {
+                    Picker("SIM Seçimi", selection: $selectedSimSlot) {
+                        ForEach(sims) { sim in
+                            Text("SIM \(sim.simSlot + 1) • \(sim.carrierName)").tag(sim.simSlot)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal)
+                }
+
                 Picker("Görünüm", selection: $mode) {
                     Text("Son Aramalar").tag(0)
                     Text("Rehber").tag(1)
@@ -20,7 +44,11 @@ struct RecentsView: View {
                     List(filteredRecents) { rec in
                         Button {
                             let resolved = contacts.resolveName(for: rec.number) ?? rec.contactName
-                            CallKitManager.shared.startOutgoingCall(number: rec.number, contactName: resolved)
+                            CallKitManager.shared.startOutgoingCall(
+                                number: rec.number,
+                                contactName: resolved,
+                                simSlot: selectedSimSlot
+                            )
                         } label: {
                             HStack {
                                 Image(systemName: iconName(rec.type))
@@ -45,6 +73,8 @@ struct RecentsView: View {
                                     }
                                 }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
@@ -71,16 +101,74 @@ struct RecentsView: View {
                         }
                     } else {
                         List(filteredContacts) { c in
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(c.name).font(.headline)
-                                ForEach(c.numbers, id: \.self) { num in
+                            if c.numbers.count == 1, let singleNumber = c.numbers.first {
+                                Button {
+                                    CallKitManager.shared.startOutgoingCall(
+                                        number: singleNumber,
+                                        contactName: c.name,
+                                        simSlot: selectedSimSlot
+                                    )
+                                } label: {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(c.name)
+                                                .font(.headline)
+                                                .foregroundStyle(.primary)
+                                            Text(singleNumber)
+                                                .font(.subheadline)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Image(systemName: "phone.fill")
+                                            .foregroundStyle(.green)
+                                    }
+                                    .padding(.vertical, 3)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                            } else {
+                                VStack(alignment: .leading, spacing: 6) {
                                     Button {
-                                        CallKitManager.shared.startOutgoingCall(number: num, contactName: c.name)
+                                        if let firstNum = c.numbers.first {
+                                            CallKitManager.shared.startOutgoingCall(
+                                                number: firstNum,
+                                                contactName: c.name,
+                                                simSlot: selectedSimSlot
+                                            )
+                                        }
                                     } label: {
-                                        Label(num, systemImage: "phone.fill")
-                                            .font(.subheadline)
+                                        Text(c.name)
+                                            .font(.headline)
+                                            .foregroundStyle(.primary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.borderless)
+
+                                    ForEach(c.numbers, id: \.self) { num in
+                                        Button {
+                                            CallKitManager.shared.startOutgoingCall(
+                                                number: num,
+                                                contactName: c.name,
+                                                simSlot: selectedSimSlot
+                                            )
+                                        } label: {
+                                            HStack {
+                                                Image(systemName: "phone.fill")
+                                                    .foregroundStyle(.green)
+                                                Text(num)
+                                                    .font(.subheadline)
+                                                Spacer()
+                                            }
+                                            .padding(.vertical, 4)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .contentShape(Rectangle())
+                                        }
+                                        .buttonStyle(.borderless)
                                     }
                                 }
+                                .padding(.vertical, 2)
                             }
                         }
                         .listStyle(.plain)

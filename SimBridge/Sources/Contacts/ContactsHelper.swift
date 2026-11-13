@@ -44,6 +44,25 @@ final class ContactsHelper: ObservableObject {
         return suffixIndex[suffix]
     }
 
+    func resolveTarget(for query: String) -> (number: String, name: String?)? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // If query matches a contact name (exact first, then substring), prefer their primary number.
+        if let exact = contacts.first(where: { $0.name.localizedCaseInsensitiveCompare(trimmed) == .orderedSame }),
+           let num = exact.numbers.first {
+            return (num, exact.name)
+        }
+        if let partial = contacts.first(where: { $0.name.localizedCaseInsensitiveContains(trimmed) }),
+           let num = partial.numbers.first {
+            return (num, partial.name)
+        }
+
+        let dialChars = trimmed.filter { $0.isNumber || $0 == "+" || $0 == "*" || $0 == "#" }
+        guard !dialChars.isEmpty else { return nil }
+        return (dialChars, resolveName(for: dialChars))
+    }
+
     private func loadContacts() {
         Task.detached(priority: .utility) {
             let keys: [CNKeyDescriptor] = [

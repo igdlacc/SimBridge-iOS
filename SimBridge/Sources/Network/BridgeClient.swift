@@ -180,17 +180,22 @@ final class BridgeClient: ObservableObject {
     @Published private(set) var smsMessages: [SmsMessageDto] = []
     @Published private(set) var deviceStatus: DeviceStatusDto?
     @Published private(set) var statusBanner: String = "Eşleştirme bekleniyor"
+    @Published private(set) var lastCallError: String?
 
     private let urlSession: URLSession
     private var wsTask: URLSessionWebSocketTask?
     private let udpTransport = UdpAudioTransport()
     private var bonjourBrowser: NWBrowser?
+    private var pathMonitor: NWPathMonitor?
+    private var foregroundObserver: NSObjectProtocol?
 
     private var cachedVoipToken: String?
     private var cachedAlertToken: String?
     private var isConnecting = false
     private var reconnectTask: Task<Void, Never>?
+    private var retryTask: Task<Void, Never>?
     private var keepaliveTimer: Task<Void, Never>?
+    private var errorClearTask: Task<Void, Never>?
 
     private init() {
         let cfg = URLSessionConfiguration.default
@@ -198,6 +203,17 @@ final class BridgeClient: ObservableObject {
         // Keepalive runs every 10s, so use a generous idle timeout to avoid spurious WS drops.
         cfg.timeoutIntervalForRequest = 45
         urlSession = URLSession(configuration: cfg)
+
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleAppBecameActive()
+            }
+        }
+        startNetworkMonitor()
 
         if let stored = PairingStore.shared.load() {
             isPaired = true
@@ -286,6 +302,8 @@ final class BridgeClient: ObservableObject {
     func disconnect() {
         reconnectTask?.cancel()
         reconnectTask = nil
+        retryTask?.cancel()
+        retryTask = nil
         isConnecting = false
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
@@ -293,6 +311,45 @@ final class BridgeClient: ObservableObject {
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
         isConnected = false
+    }
+
+    func reportUiError(_ message: String) {
+        errorClearTask?.cancel()
+        lastCallError = message
+        errorClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.lastCallError = nil
+        }
+    }
+
+    func handleAppBecameActive() {
+        guard isPaired else { return }
+        if !isConnected {
+            connectNow()
+            return
+        }
+        guard let task = wsTask else {
+            isConnected = false
+            connectNow(force: true)
+            return
+        }
+        // Probe sockets that iOS silently tore down while suspended in background.
+        task.sendPing { [weak self] err in
+            Task { @MainActor in
+                guard let self else { return }
+                if err != nil {
+                    if self.wsTask === task {
+                        task.cancel(with: .goingAway, reason: nil)
+                        self.wsTask = nil
+                        self.isConnected = false
+                    }
+                    self.connectNow(force: true)
+                } else {
+                    self.sendCommand(BridgeWsMessage(type: "sync_request"))
+                }
+            }
+        }
     }
 
     func startUdpSession(callId: String) {
@@ -318,18 +375,70 @@ final class BridgeClient: ObservableObject {
         )
     }
 
-    func sendCommand(_ message: BridgeWsMessage) {
-        guard let task = wsTask,
-              let stored = PairingStore.shared.load(),
+    private func encodeWsEnvelope(_ message: BridgeWsMessage) -> String? {
+        guard let stored = PairingStore.shared.load(),
               let key = BridgeCrypto.decodeBase64Url(stored.keyB64),
               let jsonData = try? JSONEncoder().encode(message),
               let plainStr = String(data: jsonData, encoding: .utf8),
               let encB64 = try? BridgeCrypto.encryptStringGcm(plainStr, key: key),
               let envData = try? JSONEncoder().encode(EncryptedWsEnvelope(enc: encB64)),
               let envStr = String(data: envData, encoding: .utf8) else {
+            return nil
+        }
+        return envStr
+    }
+
+    private func sendEnvelope(_ envStr: String, on task: URLSessionWebSocketTask) async -> Bool {
+        await withCheckedContinuation { cont in
+            task.send(.string(envStr)) { err in
+                cont.resume(returning: err == nil)
+            }
+        }
+    }
+
+    func sendCommand(_ message: BridgeWsMessage) {
+        guard let task = wsTask, let envStr = encodeWsEnvelope(message) else {
             return
         }
         task.send(.string(envStr)) { _ in }
+    }
+
+    /// Sends `place_call` reliably: probes/reconnects automatically if the WebSocket dropped in background.
+    func sendPlaceCall(_ message: BridgeWsMessage, completion: @escaping (Bool) -> Void) {
+        guard let envStr = encodeWsEnvelope(message) else {
+            completion(false)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else {
+                completion(false)
+                return
+            }
+            if self.isConnected, let task = self.wsTask {
+                if await self.sendEnvelope(envStr, on: task) {
+                    completion(true)
+                    return
+                }
+                if self.wsTask === task {
+                    task.cancel(with: .goingAway, reason: nil)
+                    self.wsTask = nil
+                    self.isConnected = false
+                }
+            }
+
+            if !self.isConnecting {
+                self.connectNow()
+            }
+            for _ in 0..<45 {
+                if self.isConnected, let task = self.wsTask {
+                    let ok = await self.sendEnvelope(envStr, on: task)
+                    completion(ok)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            completion(false)
+        }
     }
 
     private func sendHello() {
@@ -343,33 +452,65 @@ final class BridgeClient: ObservableObject {
         )
     }
 
+    private func connectWithTimeout(
+        url: URL,
+        helloEnvStr: String,
+        timeoutNs: UInt64 = 1_800_000_000
+    ) async throws -> (URLSessionWebSocketTask, URLSessionWebSocketTask.Message) {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2
+        let task = urlSession.webSocketTask(with: req)
+        task.resume()
+        do {
+            let firstMsg = try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+                group.addTask {
+                    try await task.send(.string(helloEnvStr))
+                    return try await task.receive()
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: timeoutNs)
+                    throw URLError(.timedOut)
+                }
+                guard let first = try await group.next() else {
+                    throw URLError(.unknown)
+                }
+                group.cancelAll()
+                return first
+            }
+            return (task, firstMsg)
+        } catch {
+            task.cancel(with: .goingAway, reason: nil)
+            throw error
+        }
+    }
+
     private func raceAndConnect(ips: [String], wsPort: Int, key: Data) async {
+        retryTask?.cancel()
+        retryTask = nil
         let authToken = BridgeCrypto.deriveWsAuthToken(key: key)
         wsTask?.cancel(with: .normalClosure, reason: nil)
         wsTask = nil
         isConnected = false
 
+        let hello = BridgeWsMessage(
+            type: "hello",
+            voipToken: cachedVoipToken,
+            alertToken: cachedAlertToken,
+            clientName: UIDevice.current.name
+        )
+        guard let plainData = try? JSONEncoder().encode(hello),
+              let plain = String(data: plainData, encoding: .utf8),
+              let encB64 = try? BridgeCrypto.encryptStringGcm(plain, key: key),
+              let envData = try? JSONEncoder().encode(EncryptedWsEnvelope(enc: encB64)),
+              let envStr = String(data: envData, encoding: .utf8) else {
+            return
+        }
+
         for ip in ips {
             if Task.isCancelled { return }
             guard let url = URL(string: "ws://\(ip):\(wsPort)/ws?auth=\(authToken)") else { continue }
-            var req = URLRequest(url: url)
-            req.timeoutInterval = 4
-            let task = urlSession.webSocketTask(with: req)
-            task.resume()
-
             do {
-                let hello = BridgeWsMessage(
-                    type: "hello",
-                    voipToken: cachedVoipToken,
-                    alertToken: cachedAlertToken,
-                    clientName: UIDevice.current.name
-                )
-                let plain = String(data: try JSONEncoder().encode(hello), encoding: .utf8)!
-                let encB64 = try BridgeCrypto.encryptStringGcm(plain, key: key)
-                let envStr = String(data: try JSONEncoder().encode(EncryptedWsEnvelope(enc: encB64)), encoding: .utf8)!
-                try await task.send(.string(envStr))
-
-                let firstMsg = try await task.receive()
+                let (task, firstMsg) = try await connectWithTimeout(url: url, helloEnvStr: envStr)
                 if Task.isCancelled {
                     task.cancel(with: .goingAway, reason: nil)
                     return
@@ -384,11 +525,23 @@ final class BridgeClient: ObservableObject {
                 self.startKeepaliveLoop()
                 return
             } catch {
-                task.cancel(with: .goingAway, reason: nil)
+                // Continue rapidly to next candidate IP after 1.8s timeout.
             }
         }
         isConnected = false
-        statusBanner = "Android erişilemiyor"
+        statusBanner = "Android bekleniyor (yeniden deneniyor...)"
+        scheduleAutoRetry()
+    }
+
+    private func scheduleAutoRetry() {
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled, let self, self.isPaired, !self.isConnected, !self.isConnecting else {
+                return
+            }
+            self.connectNow()
+        }
     }
 
     private func listenLoop(task: URLSessionWebSocketTask, key: Data) {
@@ -403,7 +556,7 @@ final class BridgeClient: ObservableObject {
                     self.wsTask = nil
                     self.isConnected = false
                     self.statusBanner = "Bağlantı koptu, yeniden deneniyor..."
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    try? await Task.sleep(nanoseconds: 800_000_000)
                     guard !Task.isCancelled, !self.isConnected, !self.isConnecting, self.wsTask == nil else {
                         return
                     }
@@ -426,7 +579,10 @@ final class BridgeClient: ObservableObject {
 
         switch wsMsg.type {
         case "snapshot":
-            if let calls = wsMsg.activeCalls { activeCalls = calls }
+            if let calls = wsMsg.activeCalls {
+                activeCalls = calls
+                CallKitManager.shared.reconcileActiveCalls(calls)
+            }
             if let recents = wsMsg.recentCalls { recentCalls = recents }
             if let sms = wsMsg.smsList { smsMessages = sms }
             if let st = wsMsg.status { deviceStatus = st }
@@ -499,5 +655,18 @@ final class BridgeClient: ObservableObject {
         }
         browser.start(queue: DispatchQueue.global(qos: .utility))
         bonjourBrowser = browser
+    }
+
+    private func startNetworkMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor in
+                guard let self, self.isPaired, !self.isConnected, !self.isConnecting else { return }
+                self.connectNow()
+            }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        pathMonitor = monitor
     }
 }

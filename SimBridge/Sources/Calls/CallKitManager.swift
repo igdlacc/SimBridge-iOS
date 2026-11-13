@@ -13,6 +13,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var callIdByUuid: [UUID: String] = [:]
     private var numberByUuid: [UUID: String] = [:]
     private var simSlotByUuid: [UUID: Int] = [:]
+    private var callCreatedAtByUuid: [UUID: Date] = [:]
     private var pendingOutgoingUuid: UUID?
     private var activeAudioCallId: String?
 
@@ -46,6 +47,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             callIdByUuid[uuid] = callId
             numberByUuid[uuid] = number
             simSlotByUuid[uuid] = simSlot
+            callCreatedAtByUuid[uuid] = Date()
         }
         lock.unlock()
 
@@ -66,14 +68,55 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     }
 
     func startOutgoingCall(number: String, contactName: String? = nil, simSlot: Int = 0) {
-        let clean = number.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
+        let allowed = CharacterSet(charactersIn: "0123456789+*#- ()")
+        let clean = String(number.unicodeScalars.filter { allowed.contains($0) })
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasDialableChars = clean.contains { $0.isNumber || $0 == "+" || $0 == "*" || $0 == "#" }
+        guard hasDialableChars else { return }
+
+        guard PairingStore.shared.load() != nil else {
+            Task { @MainActor in
+                BridgeClient.shared.reportUiError("Önce Ayarlar'dan Android ile eşleştirin")
+            }
+            return
+        }
+
+        let liveSystemCalls = callController.callObserver.calls.filter { !$0.hasEnded }
+        let now = Date()
+
+        lock.lock()
+        if liveSystemCalls.isEmpty {
+            // Self-heal any orphaned local call mappings if CallKit reports no active calls.
+            uuidByCallId.removeAll()
+            callIdByUuid.removeAll()
+            numberByUuid.removeAll()
+            simSlotByUuid.removeAll()
+            callCreatedAtByUuid.removeAll()
+            pendingOutgoingUuid = nil
+            activeAudioCallId = nil
+        } else {
+            if let pend = pendingOutgoingUuid,
+               let started = callCreatedAtByUuid[pend],
+               now.timeIntervalSince(started) < 2.5 {
+                // Ignore accidental double-tap while an outgoing request is already in flight.
+                lock.unlock()
+                return
+            }
+            lock.unlock()
+            Task { @MainActor in
+                BridgeClient.shared.reportUiError("Önce mevcut aramayı sonlandırın")
+            }
+            return
+        }
 
         let uuid = UUID()
-        lock.lock()
+        let callId = uuid.uuidString
         pendingOutgoingUuid = uuid
+        uuidByCallId[callId] = uuid
+        callIdByUuid[uuid] = callId
         numberByUuid[uuid] = clean
         simSlotByUuid[uuid] = simSlot
+        callCreatedAtByUuid[uuid] = now
         lock.unlock()
 
         let handle = CXHandle(type: .phoneNumber, value: clean)
@@ -81,8 +124,11 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         action.contactIdentifier = contactName
         action.isVideo = false
         callController.request(CXTransaction(action: action)) { err in
-            if err != nil {
+            if let err {
                 self.removeMapping(uuid: uuid)
+                Task { @MainActor in
+                    BridgeClient.shared.reportUiError("Arama başlatılamadı: \(err.localizedDescription)")
+                }
             }
         }
     }
@@ -141,13 +187,73 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             }
         case "disconnected":
             if let uuid {
-                provider.reportCall(with: uuid, endedAt: Date(), reason: .remoteEnded)
+                let reason: CXCallEndedReason = (dto.connectedAtMs == 0 && dto.disconnectReason != nil)
+                    ? .failed
+                    : .remoteEnded
+                provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
                 removeMapping(uuid: uuid)
             }
-            AudioEngineManager.shared.stop()
-            BridgeClient.shared.stopUdpSession()
+            lock.lock()
+            let emptyAfterRemove = callIdByUuid.isEmpty
+            lock.unlock()
+            if emptyAfterRemove {
+                AudioEngineManager.shared.stop()
+                BridgeClient.shared.stopUdpSession()
+            }
         default:
             break
+        }
+    }
+
+    @MainActor
+    func reconcileActiveCalls(_ remoteCalls: [CallStateDto]) {
+        let remoteIds = Set(remoteCalls.map(\.callId))
+        let now = Date()
+        var staleUuids: [UUID] = []
+
+        lock.lock()
+        for (uuid, cid) in callIdByUuid {
+            if !remoteIds.contains(cid) {
+                let age = callCreatedAtByUuid[uuid].map { now.timeIntervalSince($0) } ?? 999
+                if age > 8.0 {
+                    staleUuids.append(uuid)
+                }
+            }
+        }
+        lock.unlock()
+
+        for uuid in staleUuids {
+            provider.reportCall(with: uuid, endedAt: now, reason: .remoteEnded)
+            removeMapping(uuid: uuid)
+        }
+        if !staleUuids.isEmpty {
+            lock.lock()
+            let emptyAfterRemove = callIdByUuid.isEmpty
+            lock.unlock()
+            if emptyAfterRemove {
+                AudioEngineManager.shared.stop()
+                BridgeClient.shared.stopUdpSession()
+            }
+        }
+    }
+
+    func failCallIfStillTracked(uuid: UUID) {
+        lock.lock()
+        let tracked = callIdByUuid[uuid] != nil
+        lock.unlock()
+        guard tracked else { return }
+
+        provider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+        removeMapping(uuid: uuid)
+
+        lock.lock()
+        let emptyAfterRemove = callIdByUuid.isEmpty
+        lock.unlock()
+        if emptyAfterRemove {
+            AudioEngineManager.shared.stop()
+            Task { @MainActor in
+                BridgeClient.shared.stopUdpSession()
+            }
         }
     }
 
@@ -163,6 +269,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         callIdByUuid.removeAll()
         numberByUuid.removeAll()
         simSlotByUuid.removeAll()
+        callCreatedAtByUuid.removeAll()
         pendingOutgoingUuid = nil
         activeAudioCallId = nil
         lock.unlock()
@@ -177,13 +284,18 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         activeAudioCallId = cid
         lock.unlock()
 
-        Task { @MainActor in
-            BridgeClient.shared.sendCommand(
-                BridgeWsMessage(type: "place_call", number: number, simSlot: simSlot)
-            )
-            BridgeClient.shared.startUdpSession(callId: cid)
-        }
         action.fulfill()
+        Task { @MainActor in
+            let msg = BridgeWsMessage(type: "place_call", callId: cid, number: number, simSlot: simSlot)
+            BridgeClient.shared.sendPlaceCall(msg) { ok in
+                if ok {
+                    BridgeClient.shared.startUdpSession(callId: cid)
+                } else {
+                    BridgeClient.shared.reportUiError("Android'e bağlanılamadı, arama iptal edildi")
+                    self.failCallIfStillTracked(uuid: action.callUUID)
+                }
+            }
+        }
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
@@ -295,6 +407,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         }
         numberByUuid.removeValue(forKey: uuid)
         simSlotByUuid.removeValue(forKey: uuid)
+        callCreatedAtByUuid.removeValue(forKey: uuid)
         if pendingOutgoingUuid == uuid { pendingOutgoingUuid = nil }
         lock.unlock()
     }

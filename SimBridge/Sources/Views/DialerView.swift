@@ -19,6 +19,17 @@ struct DialerView: View {
             VStack(spacing: 14) {
                 ConnectionStatusPill()
 
+                if let err = bridge.lastCallError {
+                    Text(err)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(Color.red.opacity(0.9))
+                        .clipShape(Capsule())
+                        .padding(.horizontal)
+                }
+
                 if let active = bridge.activeCalls.first {
                     ActiveCallCard(call: active)
                 }
@@ -111,10 +122,14 @@ struct DialerView: View {
                             .font(.title2)
                             .foregroundStyle(.white)
                             .frame(width: 72, height: 72)
-                            .background(bridge.isConnected && !numberText.isEmpty ? Color.green : Color.gray)
+                            .background(
+                                !bridge.isPaired || numberText.isEmpty
+                                    ? Color.gray
+                                    : (bridge.isConnected ? Color.green : Color.orange)
+                            )
                             .clipShape(Circle())
                     }
-                    .disabled(!bridge.isConnected || numberText.isEmpty)
+                    .disabled(!bridge.isPaired || numberText.isEmpty)
 
                     Button {
                         if !numberText.isEmpty { numberText.removeLast() }

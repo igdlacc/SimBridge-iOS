@@ -11,6 +11,9 @@ final class AudioEngineManager {
     private var sinkNode: AVAudioSinkNode?
     private var usingTapFallback = false
     private var activeInputSampleRate: Double = 0
+    private var activeInputChannelCount: AVAudioChannelCount = 0
+    private var configObserver: NSObjectProtocol?
+    private var configChangeWorkItem: DispatchWorkItem?
     private var opus: OpusWrapper?
     private let jitterBuffer = JitterBuffer(targetDepthFrames: 3, maxDepthFrames: 10)
 
@@ -38,12 +41,6 @@ final class AudioEngineManager {
     private var onSendAudioPacket: ((Data, UInt16, UInt32, Int32) -> Void)?
 
     private init() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleEngineConfigChange),
-            name: .AVAudioEngineConfigurationChange,
-            object: nil
-        )
     }
 
     func setMuted(_ muted: Bool) {
@@ -125,6 +122,7 @@ final class AudioEngineManager {
         var tapUsed = false
         let tapFmt = inputNode.outputFormat(forBus: 0)
         activeInputSampleRate = tapFmt.sampleRate
+        activeInputChannelCount = tapFmt.channelCount
 
         if tapFmt.channelCount > 0 && tapFmt.sampleRate > 0 {
             let sink = AVAudioSinkNode { [weak self] _, frameCount, audioBufferList -> OSStatus in
@@ -143,6 +141,7 @@ final class AudioEngineManager {
             sourceNode = srcNode
             sinkNode = attachedSink
             usingTapFallback = tapUsed
+            observeConfigChanges(for: eng)
             return true
         } catch {
             // Fallback to installTap if a specific iOS route disallows AVAudioSinkNode connection.
@@ -166,6 +165,7 @@ final class AudioEngineManager {
                 sourceNode = srcNode
                 sinkNode = nil
                 usingTapFallback = tapUsed
+                observeConfigChanges(for: eng)
                 return true
             } catch {
                 if tapUsed { eng.inputNode.removeTap(onBus: 0) }
@@ -200,6 +200,12 @@ final class AudioEngineManager {
     }
 
     private func teardownEngineLocked() {
+        configChangeWorkItem?.cancel()
+        configChangeWorkItem = nil
+        if let obs = configObserver {
+            NotificationCenter.default.removeObserver(obs)
+            configObserver = nil
+        }
         if let eng = engine {
             if usingTapFallback {
                 eng.inputNode.removeTap(onBus: 0)
@@ -215,32 +221,69 @@ final class AudioEngineManager {
         sinkNode = nil
         usingTapFallback = false
         activeInputSampleRate = 0
+        activeInputChannelCount = 0
     }
 
-    @objc private func handleEngineConfigChange(_ note: Notification) {
-        stateLock.lock()
-        let running = isRunning
-        let eng = engine
-        let prevSr = activeInputSampleRate
-        stateLock.unlock()
-        guard running, let eng else { return }
+    private func observeConfigChanges(for eng: AVAudioEngine) {
+        if let obs = configObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: eng,
+            queue: nil
+        ) { [weak self] _ in
+            self?.scheduleEngineConfigRecovery()
+        }
+    }
 
-        let currentSr = eng.inputNode.outputFormat(forBus: 0).sampleRate
-        if eng.isRunning && (currentSr == prevSr || currentSr <= 0) {
+    private func scheduleEngineConfigRecovery() {
+        stateLock.lock()
+        guard isRunning else {
+            stateLock.unlock()
+            return
+        }
+        configChangeWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.recoverEngineAfterConfigChange()
+        }
+        configChangeWorkItem = work
+        stateLock.unlock()
+        // Wait 120ms for bursty iOS route notifications to settle so CallKit speaker toggles aren't reset.
+        txEncodeQueue.asyncAfter(deadline: .now() + .milliseconds(120), execute: work)
+    }
+
+    private func recoverEngineAfterConfigChange() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard isRunning, let eng = engine else { return }
+
+        let currentFmt = eng.inputNode.outputFormat(forBus: 0)
+        let sameFormat =
+            currentFmt.sampleRate > 0 &&
+            currentFmt.sampleRate == activeInputSampleRate &&
+            currentFmt.channelCount == activeInputChannelCount
+
+        if eng.isRunning && sameFormat {
             return
         }
 
-        // Rebuild engine graph cleanly if route switch (earpiece/speaker/BT) halted engine or changed sample rate.
-        txEncodeQueue.async { [weak self] in
-            guard let self else { return }
-            self.stateLock.lock()
-            defer { self.stateLock.unlock() }
-            guard self.isRunning else { return }
-            self.teardownEngineLocked()
-            self.converter = nil
-            self.lastInputFormat = nil
-            _ = self.buildAndStartEngineLocked()
+        // For Earpiece <-> Speaker toggles where sampleRate/channels stay unchanged, restart the
+        // existing engine in place without re-initializing VoiceProcessingIO (which resets CallKit speaker UI).
+        if !eng.isRunning && sameFormat {
+            eng.prepare()
+            do {
+                try eng.start()
+                return
+            } catch {
+                // Fall through to full rebuild only if in-place restart fails.
+            }
         }
+
+        teardownEngineLocked()
+        converter = nil
+        lastInputFormat = nil
+        _ = buildAndStartEngineLocked()
     }
 
     private func handleSinkInput(
