@@ -1,0 +1,79 @@
+name: Build SimBridge Unsigned IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: "Bundle ID for IPA (e.g. matches Feather provisioning profile)"
+        required: false
+        default: "com.simbridge.ios"
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build static libopus for arm64 iOS
+        run: |
+          mkdir -p ThirdParty
+          curl -fsSL https://downloads.xiph.org/releases/opus/opus-1.5.2.tar.gz -o ThirdParty/opus.tar.gz
+          tar -xf ThirdParty/opus.tar.gz -C ThirdParty
+          cmake -S ThirdParty/opus-1.5.2 -B ThirdParty/build-opus-ios \
+            -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 \
+            -DOPUS_BUILD_SHARED_LIBRARY=OFF \
+            -DOPUS_BUILD_TESTING=OFF \
+            -DOPUS_BUILD_PROGRAMS=OFF \
+            -DOPUS_INSTALL_PKG_CONFIG_MODULE=OFF \
+            -DOPUS_INSTALL_CMAKE_CONFIG_MODULE=OFF
+          cmake --build ThirdParty/build-opus-ios --config Release -- -sdk iphoneos CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO ARCHS=arm64
+          ls -la ThirdParty/build-opus-ios/Release-iphoneos/libopus.a
+
+      - name: Generate Xcode project and build unsigned .app
+        run: |
+          BUNDLE_ID="${{ inputs.bundle_id || 'com.simbridge.ios' }}"
+          echo "Building for Bundle ID: $BUNDLE_ID"
+          xcodegen generate
+          xcodebuild \
+            -project SimBridge.xcodeproj \
+            -scheme SimBridge \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            SIMBRIDGE_BUNDLE_ID="$BUNDLE_ID" \
+            SYMROOT="$(pwd)/build" \
+            build
+
+      - name: Verify Info.plist & package IPA for Feather
+        run: |
+          APP_PATH="$(pwd)/build/Release-iphoneos/SimBridge.app"
+          test -d "$APP_PATH"
+          plutil -p "$APP_PATH/Info.plist" | grep -E "CFBundleIdentifier|UIBackgroundModes|NSMicrophoneUsageDescription"
+          mkdir -p build/ipa/Payload
+          cp -R "$APP_PATH" build/ipa/Payload/SimBridge.app
+          cd build/ipa
+          zip -qry ../../SimBridge-unsigned.ipa Payload
+          ls -lh ../../SimBridge-unsigned.ipa
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimBridge-unsigned-ipa
+          path: SimBridge-unsigned.ipa
+          if-no-files-found: error
