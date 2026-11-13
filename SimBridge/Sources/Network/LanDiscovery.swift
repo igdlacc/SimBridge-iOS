@@ -225,15 +225,16 @@ enum LanDiscovery {
             var srcLen = socklen_t(MemoryLayout<sockaddr_in>.size)
             let n = buf.withUnsafeMutableBytes { rawBuf -> Int in
                 guard let base = rawBuf.baseAddress else { return -1 }
+                let cap = rawBuf.count
                 return withUnsafeMutablePointer(to: &srcAddr) { addrPtr in
                     addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-                        Darwin.recvfrom(fd, base, buf.count, 0, saPtr, &srcLen)
+                        Darwin.recvfrom(fd, base, cap, 0, saPtr, &srcLen)
                     }
                 }
             }
             guard n > 0 else { continue }
 
-            let pktData = Data(bytes: buf, count: n)
+            let pktData = Data(buf.prefix(n))
             guard let decoded = UdpAudioPacket.decode(data: pktData, key: key),
                   decoded.type == UdpAudioPacket.typeDiscoverResp,
                   let parsed = try? JSONDecoder().decode(LanDiscoveryPayload.self, from: decoded.payload),
