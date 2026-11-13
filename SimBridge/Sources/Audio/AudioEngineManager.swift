@@ -296,7 +296,7 @@ final class AudioEngineManager: ObservableObject {
         }
 
         var attachedSink: AVAudioSinkNode?
-        let tapUsed = false
+        var tapUsed = false
         let tapFmt = inputNode.outputFormat(forBus: 0)
         activeInputSampleRate = tapFmt.sampleRate
         activeInputChannelCount = tapFmt.channelCount
