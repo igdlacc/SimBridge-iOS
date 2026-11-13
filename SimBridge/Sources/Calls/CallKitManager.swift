@@ -19,6 +19,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var reportedConnectedUuids: Set<UUID> = []
     private var pendingOutgoingUuid: UUID?
     private var activeAudioCallId: String?
+    private var userHeldCallUuids: Set<UUID> = []
+    private var internalHoldBounceUuids: Set<UUID> = []
+    private var lastHoldBounceAt: Date = .distantPast
 
     private static let conflictingCategoryOptions: AVAudioSession.CategoryOptions = [
         AVAudioSession.CategoryOptions(rawValue: 1 << 2), // .allowBluetooth / .allowBluetoothHFP
@@ -98,16 +101,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.lock()
         if liveSystemCalls.isEmpty {
             // Self-heal any orphaned local call mappings if CallKit reports no active calls.
-            uuidByCallId.removeAll()
-            callIdByUuid.removeAll()
-            numberByUuid.removeAll()
-            simSlotByUuid.removeAll()
-            callCreatedAtByUuid.removeAll()
-            outgoingUuids.removeAll()
-            reportedConnectingUuids.removeAll()
-            reportedConnectedUuids.removeAll()
-            pendingOutgoingUuid = nil
-            activeAudioCallId = nil
+            clearAllMappingsLocked()
         } else {
             if let pend = pendingOutgoingUuid,
                let started = callCreatedAtByUuid[pend],
@@ -293,22 +287,117 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     // MARK: - CXProviderDelegate
 
     func providerDidReset(_ provider: CXProvider) {
+        AudioEngineManager.shared.recordDiagnostic("CallKit providerDidReset")
         AudioEngineManager.shared.stop()
+        AudioEngineManager.shared.clearCallRouteState()
         Task { @MainActor in
             BridgeClient.shared.stopUdpSession()
         }
         lock.lock()
-        uuidByCallId.removeAll()
-        callIdByUuid.removeAll()
-        numberByUuid.removeAll()
-        simSlotByUuid.removeAll()
-        callCreatedAtByUuid.removeAll()
-        outgoingUuids.removeAll()
-        reportedConnectingUuids.removeAll()
-        reportedConnectedUuids.removeAll()
-        pendingOutgoingUuid = nil
-        activeAudioCallId = nil
+        clearAllMappingsLocked()
         lock.unlock()
+    }
+
+    func hasExternalActiveCall() -> Bool {
+        lock.lock()
+        let tracked = Set(callIdByUuid.keys)
+        lock.unlock()
+        return callController.callObserver.calls.contains { !$0.hasEnded && !tracked.contains($0.uuid) }
+    }
+
+    /// Reclaims CallKit audio activation in background (e.g., after third-party app interruption
+    /// triggers MissingEntitlement `1701737535`) via a rate-limited internal hold-bounce that does
+    /// not forward `set_hold` to Android.
+    @discardableResult
+    func reclaimAudioActivationIfNeeded(source: String) -> Bool {
+        lock.lock()
+        let tracked = Set(callIdByUuid.keys)
+        let targetUuid = activeAudioCallId.flatMap { uuidByCallId[$0] } ?? callIdByUuid.keys.first
+        guard let uuid = targetUuid,
+              !userHeldCallUuids.contains(uuid),
+              !internalHoldBounceUuids.contains(uuid),
+              Date().timeIntervalSince(lastHoldBounceAt) >= 10.0 else {
+            lock.unlock()
+            return false
+        }
+        lock.unlock()
+
+        let systemCalls = callController.callObserver.calls
+        if systemCalls.contains(where: { !$0.hasEnded && !tracked.contains($0.uuid) }) {
+            AudioEngineManager.shared.recordDiagnostic("CallKit hold-bounce skipped: external call active")
+            return false
+        }
+        guard let sysCall = systemCalls.first(where: { $0.uuid == uuid && !$0.hasEnded }) else {
+            AudioEngineManager.shared.recordDiagnostic("CallKit hold-bounce skipped: no live CallKit call")
+            return false
+        }
+
+        lock.lock()
+        guard callIdByUuid[uuid] != nil,
+              !userHeldCallUuids.contains(uuid),
+              !internalHoldBounceUuids.contains(uuid) else {
+            lock.unlock()
+            return false
+        }
+        internalHoldBounceUuids.insert(uuid)
+        lastHoldBounceAt = Date()
+        lock.unlock()
+
+        let alreadyHeld = sysCall.isOnHold
+        AudioEngineManager.shared.recordDiagnostic(
+            "CallKit hold-bounce start src=\(source) alreadyHeld=\(alreadyHeld)"
+        )
+
+        let finishBounce: (UUID) -> Void = { [weak self] bounceUuid in
+            guard let self else { return }
+            self.lock.lock()
+            self.internalHoldBounceUuids.remove(bounceUuid)
+            self.lock.unlock()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(450)) {
+                AudioEngineManager.shared.checkRecoveryAfterUnhold()
+            }
+        }
+
+        let sendUnhold = { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let stillActive = self.callIdByUuid[uuid] != nil && self.internalHoldBounceUuids.contains(uuid)
+            self.lock.unlock()
+            guard stillActive else {
+                finishBounce(uuid)
+                return
+            }
+            let unhold = CXSetHeldCallAction(call: uuid, onHold: false)
+            self.callController.request(CXTransaction(action: unhold)) { err in
+                if let err {
+                    let nsErr = err as NSError
+                    AudioEngineManager.shared.recordDiagnostic(
+                        "CallKit hold-bounce unhold ERR domain=\(nsErr.domain) code=\(nsErr.code)"
+                    )
+                }
+                finishBounce(uuid)
+            }
+        }
+
+        if alreadyHeld {
+            sendUnhold()
+        } else {
+            let hold = CXSetHeldCallAction(call: uuid, onHold: true)
+            callController.request(CXTransaction(action: hold)) { err in
+                if let err {
+                    let nsErr = err as NSError
+                    AudioEngineManager.shared.recordDiagnostic(
+                        "CallKit hold-bounce hold ERR domain=\(nsErr.domain) code=\(nsErr.code)"
+                    )
+                    finishBounce(uuid)
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + .milliseconds(250)) {
+                    sendUnhold()
+                }
+            }
+        }
+        return true
     }
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
@@ -322,6 +411,13 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.unlock()
 
         action.fulfill()
+        let update = CXCallUpdate()
+        update.supportsHolding = true
+        update.supportsGrouping = false
+        update.supportsDTMF = true
+        update.hasVideo = false
+        provider.reportCall(with: action.callUUID, updated: update)
+
         Task { @MainActor in
             let msg = BridgeWsMessage(type: "place_call", callId: cid, number: number, simSlot: simSlot)
             BridgeClient.shared.sendPlaceCall(msg) { ok in
@@ -379,16 +475,31 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
-        if !action.isOnHold {
-            configureAudioSession(source: "unhold_action")
-        }
         lock.lock()
         let callId = callIdByUuid[action.callUUID]
+        let isInternalBounce = internalHoldBounceUuids.contains(action.callUUID)
+        if !isInternalBounce {
+            if action.isOnHold {
+                userHeldCallUuids.insert(action.callUUID)
+            } else {
+                userHeldCallUuids.remove(action.callUUID)
+            }
+        }
         lock.unlock()
-        Task { @MainActor in
-            BridgeClient.shared.sendCommand(
-                BridgeWsMessage(type: "set_hold", callId: callId, held: action.isOnHold)
-            )
+
+        AudioEngineManager.shared.recordDiagnostic(
+            "CallKit setHeld held=\(action.isOnHold) internal=\(isInternalBounce)"
+        )
+
+        if !action.isOnHold {
+            configureAudioSession(source: isInternalBounce ? "bounce_unhold" : "unhold_action")
+        }
+        if !isInternalBounce {
+            Task { @MainActor in
+                BridgeClient.shared.sendCommand(
+                    BridgeWsMessage(type: "set_hold", callId: callId, held: action.isOnHold)
+                )
+            }
         }
         action.fulfill()
     }
@@ -424,15 +535,24 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-        AudioEngineManager.shared.recordDiagnostic("CallKit didDeactivate")
-        AudioEngineManager.shared.stop()
-        AudioEngineManager.shared.clearCallRouteState()
-        Task { @MainActor in
-            BridgeClient.shared.stopUdpSession()
+        lock.lock()
+        let hasActiveCalls = !callIdByUuid.isEmpty
+        let isBounce = !internalHoldBounceUuids.isEmpty
+        lock.unlock()
+
+        AudioEngineManager.shared.recordDiagnostic(
+            "CallKit didDeactivate hasCalls=\(hasActiveCalls) bounce=\(isBounce)"
+        )
+        AudioEngineManager.shared.pauseForCallKitDeactivation(preserveRecoveryState: isBounce)
+        if !hasActiveCalls {
+            AudioEngineManager.shared.clearCallRouteState()
+            Task { @MainActor in
+                BridgeClient.shared.stopUdpSession()
+            }
         }
     }
 
-    private func configureAudioSession(
+    func configureAudioSession(
         on session: AVAudioSession = AVAudioSession.sharedInstance(),
         source: String = "default"
     ) {
@@ -475,6 +595,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 )
             }
         }
+        if !session.prefersNoInterruptionsFromSystemAlerts {
+            try? session.setPrefersNoInterruptionsFromSystemAlerts(true)
+        }
 
         if !changed.isEmpty {
             audio.recordDiagnostic(
@@ -499,7 +622,24 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         outgoingUuids.remove(uuid)
         reportedConnectingUuids.remove(uuid)
         reportedConnectedUuids.remove(uuid)
+        userHeldCallUuids.remove(uuid)
+        internalHoldBounceUuids.remove(uuid)
         if pendingOutgoingUuid == uuid { pendingOutgoingUuid = nil }
         lock.unlock()
+    }
+
+    private func clearAllMappingsLocked() {
+        uuidByCallId.removeAll()
+        callIdByUuid.removeAll()
+        numberByUuid.removeAll()
+        simSlotByUuid.removeAll()
+        callCreatedAtByUuid.removeAll()
+        outgoingUuids.removeAll()
+        reportedConnectingUuids.removeAll()
+        reportedConnectedUuids.removeAll()
+        userHeldCallUuids.removeAll()
+        internalHoldBounceUuids.removeAll()
+        pendingOutgoingUuid = nil
+        activeAudioCallId = nil
     }
 }
