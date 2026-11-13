@@ -14,8 +14,19 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var numberByUuid: [UUID: String] = [:]
     private var simSlotByUuid: [UUID: Int] = [:]
     private var callCreatedAtByUuid: [UUID: Date] = [:]
+    private var outgoingUuids: Set<UUID> = []
+    private var reportedConnectingUuids: Set<UUID> = []
+    private var reportedConnectedUuids: Set<UUID> = []
     private var pendingOutgoingUuid: UUID?
     private var activeAudioCallId: String?
+
+    private static let conflictingCategoryOptions: AVAudioSession.CategoryOptions = [
+        AVAudioSession.CategoryOptions(rawValue: 1 << 2), // .allowBluetooth / .allowBluetoothHFP
+        .allowBluetoothA2DP,
+        .defaultToSpeaker,
+        .mixWithOthers,
+        .duckOthers
+    ]
 
     private override init() {
         let cfg = CXProviderConfiguration()
@@ -59,7 +70,6 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         update.supportsHolding = true
         update.supportsDTMF = true
 
-        configureAudioSession(source: "incoming_report")
         provider.reportNewIncomingCall(with: uuid, update: update) { err in
             if let err {
                 self.removeMapping(uuid: uuid)
@@ -93,6 +103,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             numberByUuid.removeAll()
             simSlotByUuid.removeAll()
             callCreatedAtByUuid.removeAll()
+            outgoingUuids.removeAll()
+            reportedConnectingUuids.removeAll()
+            reportedConnectedUuids.removeAll()
             pendingOutgoingUuid = nil
             activeAudioCallId = nil
         } else {
@@ -118,6 +131,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         numberByUuid[uuid] = clean
         simSlotByUuid[uuid] = simSlot
         callCreatedAtByUuid[uuid] = now
+        outgoingUuids.insert(uuid)
         lock.unlock()
 
         let handle = CXHandle(type: .phoneNumber, value: clean)
@@ -179,12 +193,30 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 )
             }
         case "dialing":
-            if let uuid {
-                provider.reportOutgoingCall(with: uuid, startedConnectingAt: Date())
+            if let uuid, dto.direction == "outgoing" {
+                var shouldReport = false
+                lock.lock()
+                if outgoingUuids.contains(uuid), !reportedConnectingUuids.contains(uuid) {
+                    reportedConnectingUuids.insert(uuid)
+                    shouldReport = true
+                }
+                lock.unlock()
+                if shouldReport {
+                    provider.reportOutgoingCall(with: uuid, startedConnectingAt: Date())
+                }
             }
         case "active":
-            if let uuid {
-                provider.reportOutgoingCall(with: uuid, connectedAt: Date())
+            if let uuid, dto.direction == "outgoing" {
+                var shouldReport = false
+                lock.lock()
+                if outgoingUuids.contains(uuid), !reportedConnectedUuids.contains(uuid) {
+                    reportedConnectedUuids.insert(uuid)
+                    shouldReport = true
+                }
+                lock.unlock()
+                if shouldReport {
+                    provider.reportOutgoingCall(with: uuid, connectedAt: Date())
+                }
             }
         case "disconnected":
             if let uuid {
@@ -271,6 +303,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         numberByUuid.removeAll()
         simSlotByUuid.removeAll()
         callCreatedAtByUuid.removeAll()
+        outgoingUuids.removeAll()
+        reportedConnectingUuids.removeAll()
+        reportedConnectedUuids.removeAll()
         pendingOutgoingUuid = nil
         activeAudioCallId = nil
         lock.unlock()
@@ -282,6 +317,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         let number = numberByUuid[action.callUUID] ?? action.handle.value
         let simSlot = simSlotByUuid[action.callUUID] ?? 0
         let cid = callIdByUuid[action.callUUID] ?? action.callUUID.uuidString
+        outgoingUuids.insert(action.callUUID)
         activeAudioCallId = cid
         lock.unlock()
 
@@ -343,6 +379,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
+        if !action.isOnHold {
+            configureAudioSession(source: "unhold_action")
+        }
         lock.lock()
         let callId = callIdByUuid[action.callUUID]
         lock.unlock()
@@ -373,9 +412,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         audio.recordDiagnostic(
             "CallKit didActivate cat=\(audioSession.category.rawValue) mode=\(audioSession.mode.rawValue) opts=\(audioSession.categoryOptions.rawValue) sr=\(Int(audioSession.sampleRate))Hz route=[\(AudioEngineManager.describeRoute(audioSession.currentRoute))]"
         )
-        if audioSession.category != .playAndRecord || audioSession.mode != .voiceChat {
-            configureAudioSession(on: audioSession, source: "didActivate_fix")
-        }
+        configureAudioSession(on: audioSession, source: "didActivate_verify")
 
         lock.lock()
         let cid = activeAudioCallId ?? callIdByUuid.values.first ?? "call-active"
@@ -400,27 +437,52 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         source: String = "default"
     ) {
         let audio = AudioEngineManager.shared
-        do {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .voiceChat,
-                options: [.allowBluetooth]
-            )
-            audio.recordDiagnostic(
-                "setCategory(\(source)) ok cat=\(session.category.rawValue) mode=\(session.mode.rawValue) route=[\(AudioEngineManager.describeRoute(session.currentRoute))]"
-            )
-        } catch {
-            let nsErr = error as NSError
-            audio.recordDiagnostic(
-                "setCategory(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)"
-            )
+        var changed: [String] = []
+
+        // Set category (with empty options) and mode in two separate calls, and only when they
+        // differ. Including .allowBluetooth/.allowBluetoothHFP or using the combined 3-arg call
+        // causes CallKit's native Speaker button to unhighlight immediately while audio stays on speaker.
+        if session.category != .playAndRecord || !session.categoryOptions.isDisjoint(with: Self.conflictingCategoryOptions) {
+            do {
+                try session.setCategory(.playAndRecord, options: [])
+                changed.append("cat")
+            } catch {
+                let nsErr = error as NSError
+                audio.recordDiagnostic(
+                    "setCategory(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)"
+                )
+            }
         }
-        do {
-            try session.setPreferredIOBufferDuration(0.02)
-        } catch {
-            let nsErr = error as NSError
+        if session.mode != .voiceChat {
+            do {
+                try session.setMode(.voiceChat)
+                changed.append("mode")
+            } catch {
+                let nsErr = error as NSError
+                audio.recordDiagnostic(
+                    "setMode(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)"
+                )
+            }
+        }
+        if abs(session.preferredIOBufferDuration - 0.02) > 0.002 {
+            do {
+                try session.setPreferredIOBufferDuration(0.02)
+                changed.append("ioBuf")
+            } catch {
+                let nsErr = error as NSError
+                audio.recordDiagnostic(
+                    "setPreferredIOBufferDuration(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code)"
+                )
+            }
+        }
+
+        if !changed.isEmpty {
             audio.recordDiagnostic(
-                "setPreferredIOBufferDuration(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code)"
+                "audioCfg(\(source)) updated=[\(changed.joined(separator: ","))] cat=\(session.category.rawValue) mode=\(session.mode.rawValue) opts=\(session.categoryOptions.rawValue) route=[\(AudioEngineManager.describeRoute(session.currentRoute))]"
+            )
+        } else {
+            audio.recordDiagnostic(
+                "audioCfg(\(source)) ok opts=\(session.categoryOptions.rawValue) route=[\(AudioEngineManager.describeRoute(session.currentRoute))]"
             )
         }
     }
@@ -434,6 +496,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         numberByUuid.removeValue(forKey: uuid)
         simSlotByUuid.removeValue(forKey: uuid)
         callCreatedAtByUuid.removeValue(forKey: uuid)
+        outgoingUuids.remove(uuid)
+        reportedConnectingUuids.remove(uuid)
+        reportedConnectedUuids.remove(uuid)
         if pendingOutgoingUuid == uuid { pendingOutgoingUuid = nil }
         lock.unlock()
     }
