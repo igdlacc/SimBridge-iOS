@@ -156,17 +156,30 @@ struct DialerView: View {
 
 struct ActiveCallCard: View {
     let call: CallStateDto
+    @ObservedObject private var audio = AudioEngineManager.shared
 
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
                 Text(call.contactName ?? call.number)
                     .font(.headline)
-                Text("SIM \(call.simSlot + 1) • \(call.state.uppercased())")
+                Text("SIM \(call.simSlot + 1) • \(call.state.uppercased()) • \(audio.routeDescription)")
                     .font(.caption)
                     .foregroundStyle(.green)
             }
             Spacer()
+            Button {
+                audio.setSpeakerEnabled(!audio.isSpeakerOn)
+            } label: {
+                Label(
+                    audio.isSpeakerOn ? "Ahize" : "Hoparlör",
+                    systemImage: audio.isSpeakerOn ? "speaker.wave.3.fill" : "speaker.wave.2"
+                )
+                .font(.caption.bold())
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(audio.isSpeakerOn ? .blue : .secondary)
+
             Button(role: .destructive) {
                 CallKitManager.shared.endCall(callId: call.callId)
             } label: {

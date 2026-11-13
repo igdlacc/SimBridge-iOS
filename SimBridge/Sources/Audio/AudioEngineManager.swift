@@ -1,11 +1,19 @@
 import AVFoundation
+import Combine
 import Foundation
 
-final class AudioEngineManager {
+final class AudioEngineManager: ObservableObject {
     static let shared = AudioEngineManager()
 
+    @Published private(set) var isSpeakerOn: Bool = false
+    @Published private(set) var routeDescription: String = "Beklemede"
+    @Published private(set) var diagnosticLines: [String] = []
+    @Published private(set) var voiceProcessingEnabled: Bool = AudioEngineManager.loadVoiceProcessingPreference()
+
     private let stateLock = NSLock()
+    private let diagLock = NSLock()
     private let txEncodeQueue = DispatchQueue(label: "com.simbridge.audio.tx", qos: .userInteractive)
+    private let routeSessionQueue = DispatchQueue(label: "com.simbridge.audio.route", qos: .userInitiated)
     private var engine: AVAudioEngine?
     private var sourceNode: AVAudioSourceNode?
     private var sinkNode: AVAudioSinkNode?
@@ -13,8 +21,24 @@ final class AudioEngineManager {
     private var activeInputSampleRate: Double = 0
     private var activeInputChannelCount: AVAudioChannelCount = 0
     private var configObserver: NSObjectProtocol?
+    private var routeObserver: NSObjectProtocol?
     private var configChangeWorkItem: DispatchWorkItem?
     private var opus: OpusWrapper?
+    private var diagnosticBuffer: [String] = []
+
+    private static let voiceProcessingPrefKey = "simbridge.voiceProcessingEnabled"
+    private static let diagDateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.dateFormat = "HH:mm:ss.SSS"
+        return df
+    }()
+
+    private static func loadVoiceProcessingPreference() -> Bool {
+        if UserDefaults.standard.object(forKey: voiceProcessingPrefKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: voiceProcessingPrefKey)
+    }
     private let jitterBuffer = JitterBuffer(targetDepthFrames: 3, maxDepthFrames: 10)
 
     private var converter: AVAudioConverter?
@@ -41,6 +65,143 @@ final class AudioEngineManager {
     private var onSendAudioPacket: ((Data, UInt16, UInt32, Int32) -> Void)?
 
     private init() {
+    }
+
+    func setVoiceProcessingPreference(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: Self.voiceProcessingPrefKey)
+        DispatchQueue.main.async {
+            self.voiceProcessingEnabled = enabled
+        }
+        recordDiagnostic("pref voiceProcessing=\(enabled)")
+        stateLock.lock()
+        let active = isRunning
+        if active {
+            teardownEngineLocked()
+            converter = nil
+            lastInputFormat = nil
+            _ = buildAndStartEngineLocked()
+        }
+        stateLock.unlock()
+    }
+
+    func setSpeakerEnabled(_ enabled: Bool) {
+        routeSessionQueue.async { [weak self] in
+            guard let self else { return }
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.overrideOutputAudioPort(enabled ? .speaker : .none)
+                self.recordDiagnostic(
+                    "overrideOutputAudioPort(\(enabled ? "speaker" : "none")) ok -> [\(Self.describeRoute(session.currentRoute))]"
+                )
+            } catch {
+                let nsErr = error as NSError
+                self.recordDiagnostic(
+                    "overrideOutputAudioPort(\(enabled ? "speaker" : "none")) ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)"
+                )
+            }
+            self.refreshRouteSnapshot(session: session)
+        }
+    }
+
+    func recordDiagnostic(_ message: String) {
+        let line = "[\(Self.diagDateFormatter.string(from: Date()))] \(message)"
+        diagLock.lock()
+        diagnosticBuffer.append(line)
+        if diagnosticBuffer.count > 40 {
+            diagnosticBuffer.removeFirst(diagnosticBuffer.count - 40)
+        }
+        let snapshot = diagnosticBuffer
+        diagLock.unlock()
+        DispatchQueue.main.async {
+            self.diagnosticLines = snapshot
+        }
+    }
+
+    func copyableDiagnosticsText() -> String {
+        let session = AVAudioSession.sharedInstance()
+        let header = "cat=\(session.category.rawValue) mode=\(session.mode.rawValue) opts=\(session.categoryOptions.rawValue) sr=\(Int(session.sampleRate))Hz vpPref=\(Self.loadVoiceProcessingPreference()) route=[\(Self.describeRoute(session.currentRoute))]"
+        diagLock.lock()
+        let lines = diagnosticBuffer
+        diagLock.unlock()
+        return ([header] + lines).joined(separator: "\n")
+    }
+
+    func refreshRouteSnapshot(session: AVAudioSession = AVAudioSession.sharedInstance()) {
+        let route = session.currentRoute
+        let speaker = route.outputs.contains { $0.portType == .builtInSpeaker }
+        let label = Self.shortRouteLabel(route)
+        DispatchQueue.main.async {
+            self.isSpeakerOn = speaker
+            self.routeDescription = label
+        }
+    }
+
+    func clearCallRouteState() {
+        DispatchQueue.main.async {
+            self.isSpeakerOn = false
+            self.routeDescription = "Beklemede"
+        }
+    }
+
+    static func describeRoute(_ route: AVAudioSessionRouteDescription?) -> String {
+        guard let route else { return "none" }
+        let ins = route.inputs.map { "\($0.portType.rawValue)(\($0.portName))" }.joined(separator: ",")
+        let outs = route.outputs.map { "\($0.portType.rawValue)(\($0.portName))" }.joined(separator: ",")
+        return "in:[\(ins)] out:[\(outs)]"
+    }
+
+    private static func shortRouteLabel(_ route: AVAudioSessionRouteDescription) -> String {
+        guard let firstOut = route.outputs.first else { return "Bilinmiyor" }
+        switch firstOut.portType {
+        case .builtInSpeaker:
+            return "Hoparlör"
+        case .builtInReceiver:
+            return "Ahize"
+        case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE:
+            return "Bluetooth (\(firstOut.portName))"
+        case .headphones, .headsetMic, .usbAudio:
+            return "Kulaklık (\(firstOut.portName))"
+        case .airPlay:
+            return "AirPlay"
+        default:
+            return firstOut.portName
+        }
+    }
+
+    private static func describeRouteChangeReason(_ raw: UInt?) -> String {
+        guard let raw, let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else {
+            return "unknown"
+        }
+        switch reason {
+        case .unknown: return "unknown"
+        case .newDeviceAvailable: return "newDevice"
+        case .oldDeviceUnavailable: return "oldDeviceGone"
+        case .categoryChange: return "categoryChange"
+        case .override: return "override"
+        case .wakeFromSleep: return "wakeFromSleep"
+        case .noSuitableRouteForCategory: return "noSuitableRoute"
+        case .routeConfigurationChange: return "routeConfigChange"
+        @unknown default: return "other(\(raw))"
+        }
+    }
+
+    private func startRouteObservationLocked() {
+        guard routeObserver == nil else { return }
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let self else { return }
+            let session = AVAudioSession.sharedInstance()
+            let reasonRaw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            let prev = notification.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
+            let reasonName = Self.describeRouteChangeReason(reasonRaw)
+            self.recordDiagnostic(
+                "routeChange \(reasonName)(\(reasonRaw ?? 999)) prev=[\(Self.describeRoute(prev))] now=[\(Self.describeRoute(session.currentRoute))] cat=\(session.category.rawValue) mode=\(session.mode.rawValue)"
+            )
+            self.refreshRouteSnapshot(session: session)
+        }
     }
 
     func setMuted(_ muted: Bool) {
@@ -94,15 +255,11 @@ final class AudioEngineManager {
     }
 
     private func buildAndStartEngineLocked() -> Bool {
+        startRouteObservationLocked()
         let eng = AVAudioEngine()
         let inputNode = eng.inputNode
+        let outputNode = eng.outputNode
         let mainMixer = eng.mainMixerNode
-
-        do {
-            try inputNode.setVoiceProcessingEnabled(true)
-        } catch {
-            // Continue gracefully if voice processing is unavailable on this route.
-        }
 
         let srcNode = AVAudioSourceNode(format: target48kMonoFloat) { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
             guard let self else { return noErr }
@@ -117,9 +274,29 @@ final class AudioEngineManager {
 
         eng.attach(srcNode)
         eng.connect(srcNode, to: mainMixer, format: target48kMonoFloat)
+        eng.connect(mainMixer, to: outputNode, format: nil)
+
+        if Self.loadVoiceProcessingPreference() {
+            do {
+                try inputNode.setVoiceProcessingEnabled(true)
+            } catch {
+                let nsErr = error as NSError
+                recordDiagnostic("VP input enable ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)")
+            }
+            if !outputNode.isVoiceProcessingEnabled {
+                do {
+                    try outputNode.setVoiceProcessingEnabled(true)
+                } catch {
+                    let nsErr = error as NSError
+                    recordDiagnostic("VP output enable ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)")
+                }
+            }
+        } else {
+            recordDiagnostic("VP disabled by preference")
+        }
 
         var attachedSink: AVAudioSinkNode?
-        var tapUsed = false
+        let tapUsed = false
         let tapFmt = inputNode.outputFormat(forBus: 0)
         activeInputSampleRate = tapFmt.sampleRate
         activeInputChannelCount = tapFmt.channelCount
@@ -142,6 +319,11 @@ final class AudioEngineManager {
             sinkNode = attachedSink
             usingTapFallback = tapUsed
             observeConfigChanges(for: eng)
+            let session = AVAudioSession.sharedInstance()
+            recordDiagnostic(
+                "engine started vpIn=\(inputNode.isVoiceProcessingEnabled) vpOut=\(outputNode.isVoiceProcessingEnabled) tap=\(Int(tapFmt.sampleRate))Hz/\(tapFmt.channelCount)ch cat=\(session.category.rawValue) mode=\(session.mode.rawValue) route=[\(Self.describeRoute(session.currentRoute))]"
+            )
+            refreshRouteSnapshot(session: session)
             return true
         } catch {
             // Fallback to installTap if a specific iOS route disallows AVAudioSinkNode connection.
@@ -206,6 +388,10 @@ final class AudioEngineManager {
             NotificationCenter.default.removeObserver(obs)
             configObserver = nil
         }
+        if let routeObs = routeObserver {
+            NotificationCenter.default.removeObserver(routeObs)
+            routeObserver = nil
+        }
         if let eng = engine {
             if usingTapFallback {
                 eng.inputNode.removeTap(onBus: 0)
@@ -214,7 +400,24 @@ final class AudioEngineManager {
                 eng.disconnectNodeInput(sink)
                 eng.detach(sink)
             }
-            eng.stop()
+            if let src = sourceNode {
+                eng.disconnectNodeOutput(src)
+                eng.detach(src)
+            }
+            if eng.isRunning {
+                eng.stop()
+            }
+            if eng.inputNode.isVoiceProcessingEnabled {
+                do {
+                    try eng.inputNode.setVoiceProcessingEnabled(false)
+                } catch {
+                    let nsErr = error as NSError
+                    recordDiagnostic("VP input disable ERR domain=\(nsErr.domain) code=\(nsErr.code)")
+                }
+            }
+            if eng.outputNode.isVoiceProcessingEnabled {
+                try? eng.outputNode.setVoiceProcessingEnabled(false)
+            }
         }
         engine = nil
         sourceNode = nil
@@ -264,6 +467,11 @@ final class AudioEngineManager {
             currentFmt.sampleRate == activeInputSampleRate &&
             currentFmt.channelCount == activeInputChannelCount
 
+        recordDiagnostic(
+            "configChange engRunning=\(eng.isRunning) old=\(Int(activeInputSampleRate))Hz/\(activeInputChannelCount)ch new=\(Int(currentFmt.sampleRate))Hz/\(currentFmt.channelCount)ch route=[\(Self.describeRoute(AVAudioSession.sharedInstance().currentRoute))]"
+        )
+        refreshRouteSnapshot()
+
         if eng.isRunning && sameFormat {
             return
         }
@@ -274,12 +482,15 @@ final class AudioEngineManager {
             eng.prepare()
             do {
                 try eng.start()
+                recordDiagnostic("configChange in-place restart ok")
                 return
             } catch {
-                // Fall through to full rebuild only if in-place restart fails.
+                let nsErr = error as NSError
+                recordDiagnostic("configChange in-place restart ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)")
             }
         }
 
+        recordDiagnostic("configChange rebuilding engine")
         teardownEngineLocked()
         converter = nil
         lastInputFormat = nil

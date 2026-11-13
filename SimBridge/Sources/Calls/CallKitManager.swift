@@ -59,6 +59,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         update.supportsHolding = true
         update.supportsDTMF = true
 
+        configureAudioSession(source: "incoming_report")
         provider.reportNewIncomingCall(with: uuid, update: update) { err in
             if let err {
                 self.removeMapping(uuid: uuid)
@@ -276,7 +277,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
-        configureAudioSession()
+        configureAudioSession(source: "start_action")
         lock.lock()
         let number = numberByUuid[action.callUUID] ?? action.handle.value
         let simSlot = simSlotByUuid[action.callUUID] ?? 0
@@ -299,7 +300,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
-        configureAudioSession()
+        configureAudioSession(source: "answer_action")
         lock.lock()
         let callId = callIdByUuid[action.callUUID]
         activeAudioCallId = callId
@@ -368,34 +369,59 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        let audio = AudioEngineManager.shared
+        audio.recordDiagnostic(
+            "CallKit didActivate cat=\(audioSession.category.rawValue) mode=\(audioSession.mode.rawValue) opts=\(audioSession.categoryOptions.rawValue) sr=\(Int(audioSession.sampleRate))Hz route=[\(AudioEngineManager.describeRoute(audioSession.currentRoute))]"
+        )
+        if audioSession.category != .playAndRecord || audioSession.mode != .voiceChat {
+            configureAudioSession(on: audioSession, source: "didActivate_fix")
+        }
+
         lock.lock()
         let cid = activeAudioCallId ?? callIdByUuid.values.first ?? "call-active"
         lock.unlock()
 
-        AudioEngineManager.shared.start(callId: cid) { encoded, seq, ts, callHash in
+        audio.start(callId: cid) { encoded, seq, ts, callHash in
             BridgeClient.shared.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
         }
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        AudioEngineManager.shared.recordDiagnostic("CallKit didDeactivate")
         AudioEngineManager.shared.stop()
+        AudioEngineManager.shared.clearCallRouteState()
         Task { @MainActor in
             BridgeClient.shared.stopUdpSession()
         }
     }
 
-    private func configureAudioSession() {
-        let session = AVAudioSession.sharedInstance()
+    private func configureAudioSession(
+        on session: AVAudioSession = AVAudioSession.sharedInstance(),
+        source: String = "default"
+    ) {
+        let audio = AudioEngineManager.shared
         do {
             try session.setCategory(
                 .playAndRecord,
                 mode: .voiceChat,
                 options: [.allowBluetooth]
             )
-            try session.setPreferredSampleRate(48_000)
+            audio.recordDiagnostic(
+                "setCategory(\(source)) ok cat=\(session.category.rawValue) mode=\(session.mode.rawValue) route=[\(AudioEngineManager.describeRoute(session.currentRoute))]"
+            )
+        } catch {
+            let nsErr = error as NSError
+            audio.recordDiagnostic(
+                "setCategory(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)"
+            )
+        }
+        do {
             try session.setPreferredIOBufferDuration(0.02)
         } catch {
-            // AudioSession setup may log warnings under simulator or background state transitions.
+            let nsErr = error as NSError
+            audio.recordDiagnostic(
+                "setPreferredIOBufferDuration(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code)"
+            )
         }
     }
 

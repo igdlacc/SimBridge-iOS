@@ -1,9 +1,12 @@
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     @ObservedObject private var bridge = BridgeClient.shared
     @ObservedObject private var contacts = ContactsHelper.shared
+    @ObservedObject private var audio = AudioEngineManager.shared
     @State private var showingScanner = false
+    @State private var copiedAudioLog = false
 
     var body: some View {
         NavigationStack {
@@ -50,6 +53,27 @@ struct SettingsView: View {
                         }
                     } else {
                         LabeledContent("Rehber", value: "\(contacts.contacts.count) kişi yüklendi ✓")
+                    }
+                }
+
+                Section("Ses & Hoparlör") {
+                    LabeledContent("Aktif Ses Rotası", value: audio.routeDescription)
+                    Toggle(
+                        "Ses İşleme (Yankı Engelleme / AEC)",
+                        isOn: Binding(
+                            get: { audio.voiceProcessingEnabled },
+                            set: { audio.setVoiceProcessingPreference($0) }
+                        )
+                    )
+                    Button(copiedAudioLog ? "Ses Tanı Logu Kopyalandı ✓" : "Ses Tanı Logunu Kopyala") {
+                        UIPasteboard.general.string = audio.copyableDiagnosticsText()
+                        copiedAudioLog = true
+                    }
+                    if !audio.diagnosticLines.isEmpty {
+                        Text(audio.diagnosticLines.suffix(6).joined(separator: "\n"))
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
                 }
 
