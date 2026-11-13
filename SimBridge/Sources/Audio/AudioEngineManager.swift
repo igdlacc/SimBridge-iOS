@@ -561,7 +561,9 @@ final class AudioEngineManager: ObservableObject {
 
         let session = AVAudioSession.sharedInstance()
         if !isForeground && (fromProbe || reason == "interruption_ended") {
-            if session.isOtherAudioPlaying || session.secondaryAudioShouldBeSilencedHint {
+            // With `.mixWithOthers`, `isOtherAudioPlaying` is true while peacefully coexisting with
+            // apps like Instagram; only defer when iOS explicitly signals exclusive audio takeover.
+            if session.secondaryAudioShouldBeSilencedHint {
                 if !fromProbe || currentProbeCount <= 2 {
                     recordDiagnostic(
                         "recovery deferred (\(reason)): otherAudio=\(session.isOtherAudioPlaying) silenceHint=\(session.secondaryAudioShouldBeSilencedHint)"
@@ -738,7 +740,7 @@ final class AudioEngineManager: ObservableObject {
         } else {
             isInterrupted = true
             speakerBeforeInterruption = shouldRestoreSpeaker
-            scheduleRecoveryLocked(delayMs: 800, allowHoldBounce: false, reason: "start_failed", fromProbe: true)
+            scheduleRecoveryLocked(delayMs: 250, allowHoldBounce: false, reason: "start_failed", fromProbe: true)
         }
     }
 
@@ -1059,7 +1061,7 @@ final class AudioEngineManager: ObservableObject {
         lastInputFormat = nil
         if !buildAndStartEngineLocked() {
             isInterrupted = true
-            scheduleRecoveryLocked(delayMs: 800, allowHoldBounce: false, reason: "config_rebuild_failed", fromProbe: true)
+            scheduleRecoveryLocked(delayMs: 250, allowHoldBounce: false, reason: "config_rebuild_failed", fromProbe: true)
         }
     }
 

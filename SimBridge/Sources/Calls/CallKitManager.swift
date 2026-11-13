@@ -23,11 +23,23 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var internalHoldBounceUuids: Set<UUID> = []
     private var lastHoldBounceAt: Date = .distantPast
 
-    private static let conflictingCategoryOptions: AVAudioSession.CategoryOptions = [
-        AVAudioSession.CategoryOptions(rawValue: 1 << 2), // .allowBluetooth / .allowBluetoothHFP
+    #if compiler(>=6.2)
+    private static let bluetoothHfpOption: AVAudioSession.CategoryOptions = .allowBluetoothHFP
+    #else
+    private static let bluetoothHfpOption: AVAudioSession.CategoryOptions = .allowBluetooth
+    #endif
+
+    // Coexist with secondary media apps (e.g. Instagram feed/Reels) like WhatsApp/Telegram via
+    // `.mixWithOthers`, while pairing `.allowBluetoothHFP` with `.allowBluetoothA2DP` so CallKit's
+    // native Speaker toggle highlight does not break (Apple Developer Forums thread/64544).
+    private static let desiredCategoryOptions: AVAudioSession.CategoryOptions = [
+        bluetoothHfpOption,
         .allowBluetoothA2DP,
+        .mixWithOthers
+    ]
+
+    private static let disallowedCategoryOptions: AVAudioSession.CategoryOptions = [
         .defaultToSpeaker,
-        .mixWithOthers,
         .duckOthers
     ]
 
@@ -559,12 +571,19 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         let audio = AudioEngineManager.shared
         var changed: [String] = []
 
-        // Set category (with empty options) and mode in two separate calls, and only when they
-        // differ. Including .allowBluetooth/.allowBluetoothHFP or using the combined 3-arg call
-        // causes CallKit's native Speaker button to unhighlight immediately while audio stays on speaker.
-        if session.category != .playAndRecord || !session.categoryOptions.isDisjoint(with: Self.conflictingCategoryOptions) {
+        // Configure category and mode in two steps, only when they differ, and re-verify
+        // categoryOptions afterward because `setMode(.voiceChat)` can strip `.mixWithOthers` or
+        // `.allowBluetoothA2DP` (Telegram-iOS / GetStream CallKit pattern). Keeping `.allowBluetoothHFP`
+        // paired with `.allowBluetoothA2DP` preserves CallKit's Speaker toggle state.
+        let needsCategory =
+            session.category != .playAndRecord ||
+            !session.categoryOptions.contains(Self.desiredCategoryOptions) ||
+            !session.categoryOptions.isDisjoint(with: Self.disallowedCategoryOptions)
+        let needsMode = session.mode != .voiceChat
+
+        if needsCategory {
             do {
-                try session.setCategory(.playAndRecord, options: [])
+                try session.setCategory(.playAndRecord, options: Self.desiredCategoryOptions)
                 changed.append("cat")
             } catch {
                 let nsErr = error as NSError
@@ -573,7 +592,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 )
             }
         }
-        if session.mode != .voiceChat {
+        if needsMode {
             do {
                 try session.setMode(.voiceChat)
                 changed.append("mode")
@@ -581,6 +600,19 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 let nsErr = error as NSError
                 audio.recordDiagnostic(
                     "setMode(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)"
+                )
+            }
+        }
+        if (needsCategory || needsMode) &&
+            (!session.categoryOptions.contains(Self.desiredCategoryOptions) ||
+             !session.categoryOptions.isDisjoint(with: Self.disallowedCategoryOptions)) {
+            do {
+                try session.setCategory(.playAndRecord, options: Self.desiredCategoryOptions)
+                changed.append("cat_reapply")
+            } catch {
+                let nsErr = error as NSError
+                audio.recordDiagnostic(
+                    "setCategoryReapply(\(source)) ERR domain=\(nsErr.domain) code=\(nsErr.code): \(nsErr.localizedDescription)"
                 )
             }
         }
