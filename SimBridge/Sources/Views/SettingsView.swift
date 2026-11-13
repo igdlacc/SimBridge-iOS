@@ -13,7 +13,7 @@ struct SettingsView: View {
                     if bridge.isPaired {
                         LabeledContent("Eşleşen Cihaz", value: bridge.pairingDeviceName)
                         Button("Şimdi Yeniden Bağlan") {
-                            bridge.connectNow()
+                            bridge.connectNow(force: true)
                         }
                     }
                     Button("QR Kod ile Eşleştir / Güncelle") {

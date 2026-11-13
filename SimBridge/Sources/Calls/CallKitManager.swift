@@ -112,6 +112,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             uuid = pend
             uuidByCallId[dto.callId] = pend
             callIdByUuid[pend] = dto.callId
+            if activeAudioCallId == pend.uuidString || activeAudioCallId == nil {
+                activeAudioCallId = dto.callId
+            }
             pendingOutgoingUuid = nil
             AudioEngineManager.shared.updateCallHash(dto.callId)
         }
@@ -258,9 +261,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.unlock()
 
         AudioEngineManager.shared.start(callId: cid) { encoded, seq, ts, callHash in
-            Task { @MainActor in
-                BridgeClient.shared.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
-            }
+            BridgeClient.shared.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
         }
     }
 
@@ -277,7 +278,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             try session.setCategory(
                 .playAndRecord,
                 mode: .voiceChat,
-                options: [.allowBluetooth, .allowBluetoothA2DP]
+                options: [.allowBluetooth]
             )
             try session.setPreferredSampleRate(48_000)
             try session.setPreferredIOBufferDuration(0.02)

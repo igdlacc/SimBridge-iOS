@@ -7,6 +7,11 @@ final class UdpAudioTransport {
     private let queue = DispatchQueue(label: "com.simbridge.udp", qos: .userInteractive)
     private let lock = NSLock()
     private var connection: NWConnection?
+    private var keepaliveTimer: DispatchSourceTimer?
+    private var activeHost: String?
+    private var activePort: Int = 0
+    private var activeCallHash: Int32 = 0
+    private var isConnectionFailed = false
     private var key: Data?
     private let salt: UInt32 = UInt32.random(in: 1...UInt32.max)
     private var nonceCounter: UInt64 = 1
@@ -14,27 +19,87 @@ final class UdpAudioTransport {
     func start(host: String, port: Int, callId: String, key: Data) {
         queue.async { [weak self] in
             guard let self, let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else { return }
+            let hash = BridgeCrypto.fnv1a32(callId)
             self.lock.lock()
+            let sameTarget = (
+                self.connection != nil &&
+                !self.isConnectionFailed &&
+                self.activeHost == host &&
+                self.activePort == port &&
+                self.key == key
+            )
+            if sameTarget {
+                self.activeCallHash = hash
+                self.lock.unlock()
+                self.sendPacket(
+                    type: UdpAudioPacket.typeKeepalive,
+                    seq: 0,
+                    timestampSamples: 0,
+                    callHash: hash,
+                    payload: Data()
+                )
+                return
+            }
+
             self.connection?.cancel()
+            self.keepaliveTimer?.cancel()
+            self.keepaliveTimer = nil
+            self.activeHost = host
+            self.activePort = port
+            self.activeCallHash = hash
+            self.isConnectionFailed = false
             self.key = key
+
             let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .udp)
             self.connection = conn
             self.lock.unlock()
 
             conn.stateUpdateHandler = { [weak self] state in
-                if case .ready = state {
-                    let hash = BridgeCrypto.fnv1a32(callId)
-                    self?.sendPacket(
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.lock.lock()
+                    let curHash = self.activeCallHash
+                    self.lock.unlock()
+                    self.sendPacket(
                         type: UdpAudioPacket.typeKeepalive,
                         seq: 0,
                         timestampSamples: 0,
-                        callHash: hash,
+                        callHash: curHash,
                         payload: Data()
                     )
+                case .failed, .cancelled:
+                    self.lock.lock()
+                    if self.connection === conn {
+                        self.isConnectionFailed = true
+                    }
+                    self.lock.unlock()
+                default:
+                    break
                 }
             }
             conn.start(queue: self.queue)
             self.receiveLoop(conn: conn, key: key)
+
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + .milliseconds(1500), repeating: .milliseconds(1500))
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let hasConn = (self.connection != nil && !self.isConnectionFailed)
+                let curHash = self.activeCallHash
+                self.lock.unlock()
+                guard hasConn else { return }
+                self.sendPacket(
+                    type: UdpAudioPacket.typeKeepalive,
+                    seq: 0,
+                    timestampSamples: 0,
+                    callHash: curHash,
+                    payload: Data()
+                )
+            }
+            self.keepaliveTimer = timer
+            timer.resume()
         }
     }
 
@@ -43,8 +108,14 @@ final class UdpAudioTransport {
             guard let self else { return }
             self.lock.lock()
             let conn = self.connection
+            let timer = self.keepaliveTimer
             self.connection = nil
+            self.keepaliveTimer = nil
+            self.activeHost = nil
+            self.activePort = 0
+            self.isConnectionFailed = false
             self.lock.unlock()
+            timer?.cancel()
             conn?.cancel()
         }
     }
@@ -117,13 +188,15 @@ final class BridgeClient: ObservableObject {
 
     private var cachedVoipToken: String?
     private var cachedAlertToken: String?
+    private var isConnecting = false
     private var reconnectTask: Task<Void, Never>?
     private var keepaliveTimer: Task<Void, Never>?
 
     private init() {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = false
-        cfg.timeoutIntervalForRequest = 6
+        // Keepalive runs every 10s, so use a generous idle timeout to avoid spurious WS drops.
+        cfg.timeoutIntervalForRequest = 45
         urlSession = URLSession(configuration: cfg)
 
         if let stored = PairingStore.shared.load() {
@@ -181,13 +254,16 @@ final class BridgeClient: ObservableObject {
         }
     }
 
-    func connectNow(candidateIps: [String]? = nil, wsPort: Int? = nil, udpPort: Int? = nil) {
+    func connectNow(candidateIps: [String]? = nil, wsPort: Int? = nil, udpPort: Int? = nil, force: Bool = false) {
         guard let stored = PairingStore.shared.load(),
               let key = BridgeCrypto.decodeBase64Url(stored.keyB64) else {
             return
         }
         if let candidateIps {
             PairingStore.shared.updateIps(candidateIps)
+        }
+        if !force && (isConnected || isConnecting) {
+            return
         }
 
         var ips: [String] = []
@@ -199,13 +275,18 @@ final class BridgeClient: ObservableObject {
         let targetWsPort = wsPort ?? stored.wsPort
 
         reconnectTask?.cancel()
+        isConnecting = true
         reconnectTask = Task { [weak self] in
             guard let self else { return }
+            defer { self.isConnecting = false }
             await self.raceAndConnect(ips: ips, wsPort: targetWsPort, key: key)
         }
     }
 
     func disconnect() {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        isConnecting = false
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
         udpTransport.stop()
@@ -264,14 +345,17 @@ final class BridgeClient: ObservableObject {
 
     private func raceAndConnect(ips: [String], wsPort: Int, key: Data) async {
         let authToken = BridgeCrypto.deriveWsAuthToken(key: key)
+        wsTask?.cancel(with: .normalClosure, reason: nil)
+        wsTask = nil
+        isConnected = false
+
         for ip in ips {
             if Task.isCancelled { return }
             guard let url = URL(string: "ws://\(ip):\(wsPort)/ws?auth=\(authToken)") else { continue }
-            let task = urlSession.webSocketTask(with: url)
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 4
+            let task = urlSession.webSocketTask(with: req)
             task.resume()
-
-            wsTask?.cancel(with: .normalClosure, reason: nil)
-            wsTask = task
 
             do {
                 let hello = BridgeWsMessage(
@@ -286,6 +370,11 @@ final class BridgeClient: ObservableObject {
                 try await task.send(.string(envStr))
 
                 let firstMsg = try await task.receive()
+                if Task.isCancelled {
+                    task.cancel(with: .goingAway, reason: nil)
+                    return
+                }
+                self.wsTask = task
                 self.isConnected = true
                 self.connectedHost = ip
                 self.statusBanner = "Bağlı (\(ip))"
@@ -296,7 +385,6 @@ final class BridgeClient: ObservableObject {
                 return
             } catch {
                 task.cancel(with: .goingAway, reason: nil)
-                if wsTask === task { wsTask = nil }
             }
         }
         isConnected = false
@@ -311,9 +399,14 @@ final class BridgeClient: ObservableObject {
                     let raw = try await task.receive()
                     await self.handleWebSocketMessage(raw, key: key)
                 } catch {
+                    guard self.wsTask === task else { return }
+                    self.wsTask = nil
                     self.isConnected = false
                     self.statusBanner = "Bağlantı koptu, yeniden deneniyor..."
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard !Task.isCancelled, !self.isConnected, !self.isConnecting, self.wsTask == nil else {
+                        return
+                    }
                     self.connectNow()
                     return
                 }
@@ -372,7 +465,7 @@ final class BridgeClient: ObservableObject {
         keepaliveTimer?.cancel()
         keepaliveTimer = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 12_000_000_000)
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
                 guard let self, self.isConnected else { return }
                 self.sendCommand(BridgeWsMessage(type: "ping"))
             }
@@ -393,7 +486,7 @@ final class BridgeClient: ObservableObject {
                         if !ip.isEmpty && !ip.contains(":") {
                             Task { @MainActor in
                                 PairingStore.shared.updateIps([ip])
-                                if self?.isConnected == false {
+                                if self?.isConnected == false && self?.isConnecting == false {
                                     self?.connectNow(candidateIps: [ip])
                                 }
                             }

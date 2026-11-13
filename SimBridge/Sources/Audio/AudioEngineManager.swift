@@ -5,8 +5,12 @@ final class AudioEngineManager {
     static let shared = AudioEngineManager()
 
     private let stateLock = NSLock()
+    private let txEncodeQueue = DispatchQueue(label: "com.simbridge.audio.tx", qos: .userInteractive)
     private var engine: AVAudioEngine?
     private var sourceNode: AVAudioSourceNode?
+    private var sinkNode: AVAudioSinkNode?
+    private var usingTapFallback = false
+    private var activeInputSampleRate: Double = 0
     private var opus: OpusWrapper?
     private let jitterBuffer = JitterBuffer(targetDepthFrames: 3, maxDepthFrames: 10)
 
@@ -84,6 +88,15 @@ final class AudioEngineManager {
         converter = nil
         lastInputFormat = nil
 
+        if buildAndStartEngineLocked() {
+            isRunning = true
+        } else {
+            codec.close()
+            opus = nil
+        }
+    }
+
+    private func buildAndStartEngineLocked() -> Bool {
         let eng = AVAudioEngine()
         let inputNode = eng.inputNode
         let mainMixer = eng.mainMixerNode
@@ -108,11 +121,19 @@ final class AudioEngineManager {
         eng.attach(srcNode)
         eng.connect(srcNode, to: mainMixer, format: target48kMonoFloat)
 
+        var attachedSink: AVAudioSinkNode?
+        var tapUsed = false
         let tapFmt = inputNode.outputFormat(forBus: 0)
+        activeInputSampleRate = tapFmt.sampleRate
+
         if tapFmt.channelCount > 0 && tapFmt.sampleRate > 0 {
-            inputNode.installTap(onBus: 0, bufferSize: 960, format: nil) { [weak self] buffer, _ in
-                self?.processMicInput(buffer)
+            let sink = AVAudioSinkNode { [weak self] _, frameCount, audioBufferList -> OSStatus in
+                self?.handleSinkInput(frameCount: frameCount, audioBufferList: audioBufferList, format: tapFmt)
+                return noErr
             }
+            eng.attach(sink)
+            eng.connect(inputNode, to: sink, format: tapFmt)
+            attachedSink = sink
         }
 
         eng.prepare()
@@ -120,12 +141,37 @@ final class AudioEngineManager {
             try eng.start()
             engine = eng
             sourceNode = srcNode
-            isRunning = true
+            sinkNode = attachedSink
+            usingTapFallback = tapUsed
+            return true
         } catch {
-            eng.inputNode.removeTap(onBus: 0)
-            eng.stop()
-            codec.close()
-            opus = nil
+            // Fallback to installTap if a specific iOS route disallows AVAudioSinkNode connection.
+            if let sink = attachedSink {
+                eng.disconnectNodeInput(sink)
+                eng.detach(sink)
+                attachedSink = nil
+            }
+            if tapFmt.channelCount > 0 && tapFmt.sampleRate > 0 {
+                inputNode.installTap(onBus: 0, bufferSize: 960, format: nil) { [weak self] buffer, _ in
+                    self?.txEncodeQueue.async {
+                        self?.processMicInput(buffer)
+                    }
+                }
+                tapUsed = true
+            }
+            eng.prepare()
+            do {
+                try eng.start()
+                engine = eng
+                sourceNode = srcNode
+                sinkNode = nil
+                usingTapFallback = tapUsed
+                return true
+            } catch {
+                if tapUsed { eng.inputNode.removeTap(onBus: 0) }
+                eng.stop()
+                return false
+            }
         }
     }
 
@@ -144,12 +190,7 @@ final class AudioEngineManager {
         guard isRunning else { return }
         isRunning = false
 
-        if let eng = engine {
-            eng.inputNode.removeTap(onBus: 0)
-            eng.stop()
-        }
-        engine = nil
-        sourceNode = nil
+        teardownEngineLocked()
         converter = nil
         lastInputFormat = nil
         opus?.close()
@@ -158,16 +199,86 @@ final class AudioEngineManager {
         onSendAudioPacket = nil
     }
 
+    private func teardownEngineLocked() {
+        if let eng = engine {
+            if usingTapFallback {
+                eng.inputNode.removeTap(onBus: 0)
+            }
+            if let sink = sinkNode {
+                eng.disconnectNodeInput(sink)
+                eng.detach(sink)
+            }
+            eng.stop()
+        }
+        engine = nil
+        sourceNode = nil
+        sinkNode = nil
+        usingTapFallback = false
+        activeInputSampleRate = 0
+    }
+
     @objc private func handleEngineConfigChange(_ note: Notification) {
         stateLock.lock()
         let running = isRunning
         let eng = engine
+        let prevSr = activeInputSampleRate
         stateLock.unlock()
         guard running, let eng else { return }
 
-        // Restart engine safely if AirPods/speaker route shift halted AVAudioEngine.
-        if !eng.isRunning {
-            try? eng.start()
+        let currentSr = eng.inputNode.outputFormat(forBus: 0).sampleRate
+        if eng.isRunning && (currentSr == prevSr || currentSr <= 0) {
+            return
+        }
+
+        // Rebuild engine graph cleanly if route switch (earpiece/speaker/BT) halted engine or changed sample rate.
+        txEncodeQueue.async { [weak self] in
+            guard let self else { return }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            guard self.isRunning else { return }
+            self.teardownEngineLocked()
+            self.converter = nil
+            self.lastInputFormat = nil
+            _ = self.buildAndStartEngineLocked()
+        }
+    }
+
+    private func handleSinkInput(
+        frameCount: AVAudioFrameCount,
+        audioBufferList: UnsafePointer<AudioBufferList>,
+        format: AVAudioFormat
+    ) {
+        let frames = Int(frameCount)
+        guard frames > 0 else { return }
+        let mCount = Int(audioBufferList.pointee.mNumberBuffers)
+        guard mCount > 0 else { return }
+
+        var copied: [Data] = []
+        copied.reserveCapacity(mCount)
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
+        for i in 0..<abl.count {
+            let buf = abl[i]
+            let byteCount = Int(buf.mDataByteSize)
+            if let mData = buf.mData, byteCount > 0 {
+                copied.append(Data(bytes: mData, count: byteCount))
+            }
+        }
+        guard !copied.isEmpty else { return }
+
+        txEncodeQueue.async { [weak self] in
+            guard let self,
+                  let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
+            pcm.frameLength = frameCount
+            let dstAbl = UnsafeMutableAudioBufferListPointer(pcm.mutableAudioBufferList)
+            let count = min(copied.count, dstAbl.count)
+            for i in 0..<count {
+                copied[i].withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress, let dst = dstAbl[i].mData else { return }
+                    let nBytes = min(raw.count, Int(dstAbl[i].mDataByteSize))
+                    memcpy(dst, base, nBytes)
+                }
+            }
+            self.processMicInput(pcm)
         }
     }
 
@@ -190,7 +301,17 @@ final class AudioEngineManager {
             let count = Int(buffer.frameLength)
             convertedSamples = Array(UnsafeBufferPointer(start: ch0, count: count))
         } else {
-            if converter == nil || lastInputFormat != buffer.format {
+            let needsNewConverter: Bool
+            if let prev = lastInputFormat {
+                needsNewConverter =
+                    prev.sampleRate != buffer.format.sampleRate ||
+                    prev.channelCount != buffer.format.channelCount ||
+                    prev.commonFormat != buffer.format.commonFormat ||
+                    prev.isInterleaved != buffer.format.isInterleaved
+            } else {
+                needsNewConverter = true
+            }
+            if converter == nil || needsNewConverter {
                 converter = AVAudioConverter(from: buffer.format, to: target48kMonoFloat)
                 lastInputFormat = buffer.format
             }
@@ -201,7 +322,7 @@ final class AudioEngineManager {
 
             var consumed = false
             var err: NSError?
-            conv.convert(to: outBuf, error: &err) { _, outStatus in
+            let status = conv.convert(to: outBuf, error: &err) { _, outStatus in
                 if consumed {
                     outStatus.pointee = .noDataNow
                     return nil
@@ -210,7 +331,12 @@ final class AudioEngineManager {
                 outStatus.pointee = .haveData
                 return buffer
             }
-            guard err == nil, outBuf.frameLength > 0, let ch0 = outBuf.floatChannelData?[0] else { return }
+            if status == .error || err != nil {
+                converter?.reset()
+                converter = nil
+                return
+            }
+            guard outBuf.frameLength > 0, let ch0 = outBuf.floatChannelData?[0] else { return }
             convertedSamples = Array(UnsafeBufferPointer(start: ch0, count: Int(outBuf.frameLength)))
         }
 
