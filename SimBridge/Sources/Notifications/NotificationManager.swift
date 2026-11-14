@@ -26,14 +26,177 @@ private final class BgTaskToken: @unchecked Sendable {
     }
 }
 
+private enum SmsNotifySource {
+    case localWs
+    case remotePush
+}
+
+private struct SeenSmsEntry {
+    let smsId: String?
+    let contentKey: String
+    let source: SmsNotifySource
+    let recordedAt: Date
+}
+
 final class NotificationManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     private(set) var currentAlertTokenHex: String = ""
 
+    private let dedupLock = NSLock()
+    private var seenSmsEntries: [SeenSmsEntry] = []
+    private var activeViewingKey: String? = nil
+    private static let dedupTtlSeconds: TimeInterval = 120.0
+
     private override init() {
         super.init()
+    }
+
+    func setActivelyViewingConversationKey(_ normalizedKey: String?) {
+        dedupLock.lock()
+        activeViewingKey = normalizedKey
+        dedupLock.unlock()
+    }
+
+    private func recordOrCheckDuplicateLocked(
+        smsId: String?,
+        normAddress: String,
+        trimmedBody: String,
+        source: SmsNotifySource
+    ) -> Bool {
+        let now = Date()
+        seenSmsEntries.removeAll { now.timeIntervalSince($0.recordedAt) > Self.dedupTtlSeconds }
+
+        let cleanId = (smsId?.isEmpty == false) ? smsId : nil
+        let contentKey = normAddress.isEmpty ? "" : "\(normAddress)|\(trimmedBody)"
+
+        let alreadySeen = seenSmsEntries.contains { entry in
+            if let cleanId, let existingId = entry.smsId, existingId == cleanId {
+                return true
+            }
+            if !contentKey.isEmpty, entry.contentKey == contentKey {
+                return true
+            }
+            return false
+        }
+        if alreadySeen {
+            return true
+        }
+        seenSmsEntries.append(
+            SeenSmsEntry(
+                smsId: cleanId,
+                contentKey: contentKey,
+                source: source,
+                recordedAt: now
+            )
+        )
+        if seenSmsEntries.count > 80 {
+            seenSmsEntries.removeFirst(seenSmsEntries.count - 80)
+        }
+        return false
+    }
+
+    @MainActor
+    func handleIncomingLocalSms(_ sms: SmsMessageDto) {
+        guard !sms.isOutgoing else { return }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        // Never fire local banners for historical messages older than 90 seconds.
+        guard (nowMs - sms.timestampMs) <= 90_000 else { return }
+
+        let normKey = ContactsHelper.normalizeAddressKey(sms.address)
+        let trimmedBody = sms.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBody.isEmpty else { return }
+        let cleanId = sms.id.isEmpty ? nil : sms.id
+        let isForegroundActive = (UIApplication.shared.applicationState == .active)
+
+        dedupLock.lock()
+        let isDuplicate = recordOrCheckDuplicateLocked(
+            smsId: cleanId,
+            normAddress: normKey,
+            trimmedBody: trimmedBody,
+            source: .localWs
+        )
+        let isViewingThisChat = isForegroundActive && !normKey.isEmpty && (activeViewingKey == normKey)
+        dedupLock.unlock()
+
+        if isDuplicate || isViewingThisChat {
+            return
+        }
+
+        let resolvedSender = ContactsHelper.shared.resolveName(for: sms.address)
+            ?? (sms.contactName?.isEmpty == false ? sms.contactName! : sms.address)
+        let otp = (sms.otpCode?.isEmpty == false) ? sms.otpCode : nil
+        let address = sms.address
+        let body = sms.body
+        let simSlot = sms.simSlot
+
+        Task {
+            let center = UNUserNotificationCenter.current()
+            let delivered = await center.deliveredNotifications()
+            let alreadyInCenter = delivered.contains { notif in
+                let info = notif.request.content.userInfo
+                if let cleanId, let existingId = info["smsId"] as? String, existingId == cleanId {
+                    return true
+                }
+                let existingAddr = (info["address"] as? String) ?? ""
+                let existingBody = ((info["body"] as? String) ?? notif.request.content.body)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return !normKey.isEmpty
+                    && ContactsHelper.normalizeAddressKey(existingAddr) == normKey
+                    && existingBody == trimmedBody
+            }
+            guard !alreadyInCenter else { return }
+
+            let content = UNMutableNotificationContent()
+            content.title = resolvedSender
+            if let otp {
+                content.subtitle = "OTP Kodu: \(otp)"
+                content.categoryIdentifier = "SMS_OTP"
+            } else {
+                content.subtitle = "SIM \(simSlot + 1)"
+                content.categoryIdentifier = "SMS_MESSAGE"
+            }
+            content.body = body
+            content.sound = .default
+            content.interruptionLevel = .timeSensitive
+            if !normKey.isEmpty {
+                content.threadIdentifier = normKey
+            }
+
+            var userInfo: [String: Any] = [
+                "address": address,
+                "body": body,
+                "simSlot": simSlot
+            ]
+            if let cleanId {
+                userInfo["smsId"] = cleanId
+            }
+            if let otp {
+                userInfo["otpCode"] = otp
+            }
+            content.userInfo = userInfo
+
+            let reqId = "simbridge-local-sms-\(cleanId ?? UUID().uuidString)"
+            let req = UNNotificationRequest(identifier: reqId, content: content, trigger: nil)
+            try? await center.add(req)
+        }
+    }
+
+    func clearDeliveredNotifications(forAddress address: String) {
+        let targetKey = ContactsHelper.normalizeAddressKey(address)
+        guard !targetKey.isEmpty else { return }
+        Task {
+            let center = UNUserNotificationCenter.current()
+            let delivered = await center.deliveredNotifications()
+            let matchingIds = delivered.compactMap { notif -> String? in
+                let addr = (notif.request.content.userInfo["address"] as? String) ?? ""
+                return ContactsHelper.normalizeAddressKey(addr) == targetKey ? notif.request.identifier : nil
+            }
+            if !matchingIds.isEmpty {
+                center.removeDeliveredNotifications(withIdentifiers: matchingIds)
+            }
+        }
     }
 
     func refreshAuthorizationStatus() {
@@ -100,6 +263,30 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
+        if notification.request.trigger is UNPushNotificationTrigger {
+            let info = notification.request.content.userInfo
+            let smsId = info["smsId"] as? String
+            let address = (info["address"] as? String) ?? ""
+            let body = ((info["body"] as? String) ?? notification.request.content.body)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let normKey = ContactsHelper.normalizeAddressKey(address)
+            let isAppActive = Thread.isMainThread ? (UIApplication.shared.applicationState == .active) : true
+
+            dedupLock.lock()
+            let isDuplicate = recordOrCheckDuplicateLocked(
+                smsId: smsId,
+                normAddress: normKey,
+                trimmedBody: body,
+                source: .remotePush
+            )
+            let isViewingThisChat = isAppActive && !normKey.isEmpty && (activeViewingKey == normKey)
+            dedupLock.unlock()
+
+            if isDuplicate || isViewingThisChat {
+                completionHandler([])
+                return
+            }
+        }
         completionHandler([.banner, .sound, .list])
     }
 
@@ -109,6 +296,21 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let info = response.notification.request.content.userInfo
+        let smsId = info["smsId"] as? String
+        let rawAddr = (info["address"] as? String) ?? ""
+        let rawBody = ((info["body"] as? String) ?? response.notification.request.content.body)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !rawAddr.isEmpty || smsId != nil {
+            let normKey = ContactsHelper.normalizeAddressKey(rawAddr)
+            dedupLock.lock()
+            _ = recordOrCheckDuplicateLocked(
+                smsId: smsId,
+                normAddress: normKey,
+                trimmedBody: rawBody,
+                source: .remotePush
+            )
+            dedupLock.unlock()
+        }
         if response.actionIdentifier == "COPY_OTP",
            let otp = info["otpCode"] as? String,
            !otp.isEmpty {

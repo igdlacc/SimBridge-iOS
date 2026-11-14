@@ -436,6 +436,7 @@ final class BridgeClient: ObservableObject {
     func markConversationRead(address: String) {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        NotificationManager.shared.clearDeliveredNotifications(forAddress: trimmed)
         let key = ContactsHelper.normalizeAddressKey(trimmed)
         guard !key.isEmpty else { return }
 
@@ -1167,6 +1168,9 @@ final class BridgeClient: ObservableObject {
             }
         case "sms_received":
             if let sms = wsMsg.sms {
+                if !sms.id.isEmpty {
+                    sendCommand(BridgeWsMessage(type: "sms_ack", clientMsgId: sms.id))
+                }
                 let normNew = ContactsHelper.normalizeAddressKey(sms.address)
                 let trimmedBody = sms.body.trimmingCharacters(in: .whitespacesAndNewlines)
                 let alreadyExists = smsMessages.contains { existing in
@@ -1182,6 +1186,9 @@ final class BridgeClient: ObservableObject {
                     let adjusted = applyLocalReadState(to: [sms]).first ?? sms
                     smsMessages.insert(adjusted, at: 0)
                     scheduleEncryptedCacheSave()
+                    if !adjusted.isOutgoing {
+                        NotificationManager.shared.handleIncomingLocalSms(adjusted)
+                    }
                 }
             }
         case "sms_sent_status":

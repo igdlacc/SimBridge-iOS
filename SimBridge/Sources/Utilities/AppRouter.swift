@@ -21,11 +21,35 @@ struct SmsConversationTarget: Identifiable, Hashable {
 final class AppRouter: ObservableObject {
     static let shared = AppRouter()
 
-    @Published var selectedTab: AppTab = .dialer
+    @Published var selectedTab: AppTab = .dialer {
+        didSet {
+            syncActiveViewingNotificationFilter()
+        }
+    }
     @Published var smsTargetToOpen: SmsConversationTarget? = nil
     @Published var activeCallSheetPresented: Bool = false
+    private(set) var openConversationKey: String? = nil
 
     private init() {}
+
+    func setActiveConversation(address: String) {
+        let key = ContactsHelper.normalizeAddressKey(address)
+        openConversationKey = key.isEmpty ? nil : key
+        syncActiveViewingNotificationFilter()
+    }
+
+    func clearActiveConversation(address: String) {
+        let key = ContactsHelper.normalizeAddressKey(address)
+        if openConversationKey == key {
+            openConversationKey = nil
+            syncActiveViewingNotificationFilter()
+        }
+    }
+
+    private func syncActiveViewingNotificationFilter() {
+        let effectiveKey = (selectedTab == .sms) ? openConversationKey : nil
+        NotificationManager.shared.setActivelyViewingConversationKey(effectiveKey)
+    }
 
     func openSmsConversation(address: String, title: String? = nil) {
         let cleanAddr = address.trimmingCharacters(in: .whitespacesAndNewlines)

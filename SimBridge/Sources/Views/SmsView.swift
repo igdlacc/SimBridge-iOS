@@ -351,6 +351,7 @@ struct SmsView: View {
 struct SmsConversationView: View {
     @ObservedObject private var bridge = BridgeClient.shared
     @ObservedObject private var contacts = ContactsHelper.shared
+    @ObservedObject private var router = AppRouter.shared
     @AppStorage("simbridge.preferredSimSlot") private var preferredSimSlot: Int = 0
 
     let address: String
@@ -409,13 +410,26 @@ struct SmsConversationView: View {
                         selectedSim = bridge.validatedSimSlot(preferredSimSlot)
                         didInitSim = true
                     }
-                    bridge.markConversationRead(address: address)
+                    router.setActiveConversation(address: address)
+                    if router.selectedTab == .sms {
+                        bridge.markConversationRead(address: address)
+                    }
                     DispatchQueue.main.async {
                         proxy.scrollTo("chat_bottom_anchor", anchor: .bottom)
                     }
                 }
+                .onDisappear {
+                    router.clearActiveConversation(address: address)
+                }
+                .onChange(of: router.selectedTab) { newTab in
+                    if newTab == .sms {
+                        bridge.markConversationRead(address: address)
+                    }
+                }
                 .onChange(of: messages.count) { _ in
-                    bridge.markConversationRead(address: address)
+                    if router.selectedTab == .sms {
+                        bridge.markConversationRead(address: address)
+                    }
                 }
                 .onChange(of: totalItemCount) { _ in
                     withAnimation(.easeOut(duration: 0.2)) {
