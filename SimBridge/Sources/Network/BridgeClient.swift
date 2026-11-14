@@ -167,6 +167,11 @@ final class UdpAudioTransport {
     }
 }
 
+private struct BridgeHealthResponse: Decodable, Sendable {
+    let ok: Bool
+    let wsPort: Int?
+}
+
 @MainActor
 final class BridgeClient: ObservableObject {
     static let shared = BridgeClient()
@@ -513,10 +518,10 @@ final class BridgeClient: ObservableObject {
     nonisolated private func connectWithTimeout(
         url: URL,
         helloEnvStr: String,
-        timeoutNs: UInt64 = 1_500_000_000
+        timeoutNs: UInt64 = 2_000_000_000
     ) async throws -> (URLSessionWebSocketTask, URLSessionWebSocketTask.Message) {
         var req = URLRequest(url: url)
-        req.timeoutInterval = 2
+        req.timeoutInterval = 2.5
         let task = urlSession.webSocketTask(with: req)
         task.resume()
         do {
@@ -542,58 +547,74 @@ final class BridgeClient: ObservableObject {
         }
     }
 
-    nonisolated private func raceWebSocket(
+    nonisolated private func probeHealth(
+        ip: String,
+        wsPort: Int,
+        timeoutNs: UInt64 = 1_200_000_000
+    ) async -> (String, Int)? {
+        let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, !clean.contains(":"), wsPort > 0,
+              let url = URL(string: "http://\(clean):\(wsPort)/health") else {
+            return nil
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 1.5
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            return try await withThrowingTaskGroup(of: (String, Int)?.self) { group in
+                group.addTask { [self] in
+                    let (data, response) = try await self.urlSession.data(for: req)
+                    guard let http = response as? HTTPURLResponse,
+                          http.statusCode == 200,
+                          let health = try? JSONDecoder().decode(BridgeHealthResponse.self, from: data),
+                          health.ok else {
+                        return nil
+                    }
+                    return (clean, health.wsPort ?? wsPort)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: timeoutNs)
+                    throw URLError(.timedOut)
+                }
+                guard let candidate = try await group.next() else {
+                    return nil
+                }
+                group.cancelAll()
+                return candidate
+            }
+        } catch {
+            return nil
+        }
+    }
+
+    nonisolated private func raceHealthyHost(
         ips: [String],
         wsPort: Int,
-        authToken: String,
-        helloEnvStr: String,
         timeoutNs: UInt64
-    ) async -> ConnectOutcome? {
+    ) async -> (String, Int)? {
         var uniqueIps: [String] = []
         for ip in ips {
             let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !clean.isEmpty && !uniqueIps.contains(clean) {
+            if !clean.isEmpty && !clean.contains(":") && !uniqueIps.contains(clean) {
                 uniqueIps.append(clean)
             }
         }
         guard !uniqueIps.isEmpty else { return nil }
 
-        return await withTaskGroup(of: ConnectOutcome?.self) { group in
+        return await withTaskGroup(of: (String, Int)?.self) { group in
             for ip in uniqueIps.prefix(8) {
-                guard let url = URL(string: "ws://\(ip):\(wsPort)/ws?auth=\(authToken)") else { continue }
                 group.addTask { [self] in
-                    if Task.isCancelled { return nil }
-                    do {
-                        let (task, firstMsg) = try await self.connectWithTimeout(
-                            url: url,
-                            helloEnvStr: helloEnvStr,
-                            timeoutNs: timeoutNs
-                        )
-                        if Task.isCancelled {
-                            task.cancel(with: .goingAway, reason: nil)
-                            return nil
-                        }
-                        return ConnectOutcome(ip: ip, wsPort: wsPort, task: task, firstMsg: firstMsg)
-                    } catch {
-                        return nil
-                    }
+                    guard !Task.isCancelled else { return nil }
+                    return await self.probeHealth(ip: ip, wsPort: wsPort, timeoutNs: timeoutNs)
                 }
             }
-
-            var winner: ConnectOutcome?
-            for await outcome in group {
-                if let win = outcome {
-                    winner = win
+            for await hit in group {
+                if let win = hit {
                     group.cancelAll()
-                    break
+                    return win
                 }
             }
-            for await extra in group {
-                if let extra, extra.task !== winner?.task {
-                    extra.task.cancel(with: .goingAway, reason: nil)
-                }
-            }
-            return winner
+            return nil
         }
     }
 
@@ -626,15 +647,14 @@ final class BridgeClient: ObservableObject {
             return
         }
 
-        let winner = await withTaskGroup(of: ConnectOutcome?.self) { group -> ConnectOutcome? in
+        // Probe /health and encrypted UDP discovery first so only ONE winning socket ever opens /ws and sends hello.
+        let winningEndpoint = await withTaskGroup(of: (String, Int)?.self) { group -> (String, Int)? in
             if !ips.isEmpty {
                 group.addTask { [self] in
-                    await self.raceWebSocket(
+                    await self.raceHealthyHost(
                         ips: ips,
                         wsPort: wsPort,
-                        authToken: authToken,
-                        helloEnvStr: envStr,
-                        timeoutNs: 1_300_000_000
+                        timeoutNs: 1_200_000_000
                     )
                 }
             }
@@ -650,29 +670,42 @@ final class BridgeClient: ObservableObject {
                 await MainActor.run {
                     PairingStore.shared.updateIps(found.ips, wsPort: found.wsPort, udpPort: found.udpPort)
                 }
-                return await self.raceWebSocket(
+                return await self.raceHealthyHost(
                     ips: found.ips,
                     wsPort: targetWs,
-                    authToken: authToken,
-                    helloEnvStr: envStr,
-                    timeoutNs: 1_500_000_000
+                    timeoutNs: 1_200_000_000
                 )
             }
 
-            var picked: ConnectOutcome?
-            for await outcome in group {
-                if let win = outcome {
+            var picked: (String, Int)?
+            for await endpoint in group {
+                if let win = endpoint {
                     picked = win
                     group.cancelAll()
                     break
                 }
             }
-            for await extra in group {
-                if let extra, extra.task !== picked?.task {
-                    extra.task.cancel(with: .goingAway, reason: nil)
-                }
-            }
             return picked
+        }
+
+        if Task.isCancelled {
+            return
+        }
+
+        var winner: ConnectOutcome?
+        if let (targetIp, targetWsPort) = winningEndpoint,
+           let url = URL(string: "ws://\(targetIp):\(targetWsPort)/ws?auth=\(authToken)") {
+            if let (task, firstMsg) = try? await connectWithTimeout(
+                url: url,
+                helloEnvStr: envStr,
+                timeoutNs: 2_000_000_000
+            ) {
+                if Task.isCancelled {
+                    task.cancel(with: .goingAway, reason: nil)
+                    return
+                }
+                winner = ConnectOutcome(ip: targetIp, wsPort: targetWsPort, task: task, firstMsg: firstMsg)
+            }
         }
 
         if Task.isCancelled {
@@ -852,7 +885,7 @@ final class BridgeClient: ObservableObject {
                         let portArg = resolvedPort > 0 ? resolvedPort : nil
                         PairingStore.shared.updateIps([ip], wsPort: portArg)
                         if !self.isConnected {
-                            self.connectNow(candidateIps: [ip], wsPort: portArg, force: self.isConnecting)
+                            self.connectNow(candidateIps: [ip], wsPort: portArg)
                         }
                     }
                 }
