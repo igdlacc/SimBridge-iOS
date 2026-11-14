@@ -12,7 +12,7 @@ struct SmsConversationTarget: Identifiable, Hashable {
     let title: String
 
     var id: String {
-        let norm = ContactsHelper.normalizeSuffix(address)
+        let norm = ContactsHelper.normalizeAddressKey(address)
         return norm.isEmpty ? address : norm
     }
 }

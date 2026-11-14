@@ -55,7 +55,7 @@ struct SmsMessageDto: Codable, Identifiable, Hashable {
     let body: String
     let timestampMs: Int64
     let isOutgoing: Bool
-    let isRead: Bool
+    var isRead: Bool
     let simSlot: Int
     let otpCode: String?
 }

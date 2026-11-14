@@ -834,6 +834,7 @@ final class AudioEngineManager: ObservableObject {
         let inputNode = eng.inputNode
         let outputNode = eng.outputNode
         let mainMixer = eng.mainMixerNode
+        let renderCodec = self.opus
 
         let srcNode = AVAudioSourceNode(format: target48kMonoFloat) { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
             guard let self else { return noErr }
@@ -842,7 +843,7 @@ final class AudioEngineManager: ObservableObject {
             guard let ptr = abl.first?.mData?.assumingMemoryBound(to: Float.self) else {
                 return noErr
             }
-            self.fillOutputSamples(dst: ptr, count: count)
+            self.fillOutputSamples(dst: ptr, count: count, codec: renderCodec)
             return noErr
         }
 
@@ -893,6 +894,7 @@ final class AudioEngineManager: ObservableObject {
         eng.prepare()
         do {
             try eng.start()
+            jitterBuffer.trimToTarget()
             engine = eng
             sourceNode = srcNode
             sinkNode = attachedSink
@@ -921,6 +923,7 @@ final class AudioEngineManager: ObservableObject {
             eng.prepare()
             do {
                 try eng.start()
+                jitterBuffer.trimToTarget()
                 engine = eng
                 sourceNode = srcNode
                 sinkNode = nil
@@ -1135,6 +1138,7 @@ final class AudioEngineManager: ObservableObject {
             eng.prepare()
             do {
                 try eng.start()
+                jitterBuffer.trimToTarget()
                 recordDiagnostic("configChange in-place restart ok")
                 return
             } catch {
@@ -1304,7 +1308,7 @@ final class AudioEngineManager: ObservableObject {
         txRingLock.unlock()
     }
 
-    private func fillOutputSamples(dst: UnsafeMutablePointer<Float>, count: Int) {
+    private func fillOutputSamples(dst: UnsafeMutablePointer<Float>, count: Int, codec: OpusWrapper?) {
         rxRingLock.lock()
         defer { rxRingLock.unlock() }
 
@@ -1314,7 +1318,7 @@ final class AudioEngineManager: ObservableObject {
             rxRing.dropOldest(rxRing.count - 3840)
         }
 
-        if let codec = opus {
+        if let codec {
             while rxRing.count < count {
                 let res = jitterBuffer.pop()
                 switch res {

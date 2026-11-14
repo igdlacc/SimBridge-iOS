@@ -70,7 +70,7 @@ final class VoipPushManager: NSObject, PKPushRegistryDelegate {
         }
 
         Task { @MainActor in
-            BridgeClient.shared.connectNow(candidateIps: ips, wsPort: wsPort, udpPort: udpPort)
+            BridgeClient.shared.handleIncomingVoipPushWake(candidateIps: ips, wsPort: wsPort, udpPort: udpPort)
         }
     }
 

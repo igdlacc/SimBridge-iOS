@@ -135,6 +135,14 @@ final class ContactsHelper: ObservableObject {
         let digits = number.filter { $0.isNumber }
         return String(digits.suffix(10))
     }
+
+    nonisolated static func normalizeAddressKey(_ address: String) -> String {
+        let digits = address.filter { $0.isNumber }
+        if digits.count >= 7 {
+            return String(digits.suffix(10))
+        }
+        return address.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
 }
 
 private extension String {

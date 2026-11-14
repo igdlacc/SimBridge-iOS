@@ -113,8 +113,7 @@ struct SmsView: View {
                     }
                     .listStyle(.plain)
                     .refreshable {
-                        bridge.sendCommand(BridgeWsMessage(type: "sync_request"))
-                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        await bridge.refreshSync()
                     }
                 }
             }
@@ -256,7 +255,7 @@ struct SmsView: View {
             .font(.headline)
             if bridge.isPaired && bridge.smsMessages.isEmpty {
                 Button("Mesajları Yenile") {
-                    bridge.sendCommand(BridgeWsMessage(type: "sync_request"))
+                    Task { await bridge.refreshSync() }
                 }
                 .buttonStyle(.bordered)
             }
@@ -268,14 +267,14 @@ struct SmsView: View {
     private var threads: [SmsThreadSummary] {
         var groupedMsgs: [String: [SmsMessageDto]] = [:]
         for msg in bridge.smsMessages {
-            let norm = ContactsHelper.normalizeSuffix(msg.address)
+            let norm = ContactsHelper.normalizeAddressKey(msg.address)
             let key = norm.isEmpty ? msg.address : norm
             groupedMsgs[key, default: []].append(msg)
         }
 
         var groupedPending: [String: [PendingSmsMessage]] = [:]
         for p in bridge.pendingSms {
-            let norm = ContactsHelper.normalizeSuffix(p.address)
+            let norm = ContactsHelper.normalizeAddressKey(p.address)
             let key = norm.isEmpty ? p.address : norm
             groupedPending[key, default: []].append(p)
         }
@@ -410,9 +409,13 @@ struct SmsConversationView: View {
                         selectedSim = bridge.validatedSimSlot(preferredSimSlot)
                         didInitSim = true
                     }
+                    bridge.markConversationRead(address: address)
                     DispatchQueue.main.async {
                         proxy.scrollTo("chat_bottom_anchor", anchor: .bottom)
                     }
+                }
+                .onChange(of: messages.count) { _ in
+                    bridge.markConversationRead(address: address)
                 }
                 .onChange(of: totalItemCount) { _ in
                     withAnimation(.easeOut(duration: 0.2)) {
@@ -458,7 +461,7 @@ struct SmsConversationView: View {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.system(size: 30))
                     }
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !bridge.isConnected)
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !bridge.isPaired)
                 }
 
                 if draft.count >= 100 {
@@ -656,20 +659,20 @@ struct SmsConversationView: View {
     }
 
     private var messages: [SmsMessageDto] {
-        let key = ContactsHelper.normalizeSuffix(address)
+        let key = ContactsHelper.normalizeAddressKey(address)
         return bridge.smsMessages
             .filter {
-                let mKey = ContactsHelper.normalizeSuffix($0.address)
+                let mKey = ContactsHelper.normalizeAddressKey($0.address)
                 return (!key.isEmpty && mKey == key) || $0.address == address
             }
             .sorted { $0.timestampMs < $1.timestampMs }
     }
 
     private var pendingInThread: [PendingSmsMessage] {
-        let key = ContactsHelper.normalizeSuffix(address)
+        let key = ContactsHelper.normalizeAddressKey(address)
         return bridge.pendingSms
             .filter {
-                let pKey = ContactsHelper.normalizeSuffix($0.address)
+                let pKey = ContactsHelper.normalizeAddressKey($0.address)
                 return (!key.isEmpty && pKey == key) || $0.address == address
             }
             .sorted { $0.timestampMs < $1.timestampMs }
@@ -889,7 +892,7 @@ struct SmsComposeSheet: View {
                     .disabled(
                         recipientQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                         messageBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                        !bridge.isConnected
+                        !bridge.isPaired
                     )
                 }
             }

@@ -128,6 +128,18 @@ final class JitterBuffer {
         return .missingPlc
     }
 
+    func trimToTarget() {
+        lock.lock()
+        defer { lock.unlock() }
+        while buffer.count > targetDepthFrames {
+            guard let oldest = findOldestKey() else { break }
+            buffer.removeValue(forKey: oldest)
+            if Self.seqDiff(oldest, nextSeq) >= 0 {
+                nextSeq = oldest &+ 1
+            }
+        }
+    }
+
     func reset() {
         lock.lock()
         defer { lock.unlock() }

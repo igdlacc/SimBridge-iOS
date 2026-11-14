@@ -2,6 +2,30 @@ import Foundation
 import UIKit
 import UserNotifications
 
+private final class BgTaskToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var id: UIBackgroundTaskIdentifier = .invalid
+
+    func start(name: String) {
+        let taskId = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            self?.end()
+        }
+        lock.lock()
+        id = taskId
+        lock.unlock()
+    }
+
+    func end() {
+        lock.lock()
+        let current = id
+        id = .invalid
+        lock.unlock()
+        if current != .invalid {
+            UIApplication.shared.endBackgroundTask(current)
+        }
+    }
+}
+
 final class NotificationManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
@@ -94,15 +118,18 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
                   let address = info["address"] as? String {
             let replyText = textResp.userText.trimmingCharacters(in: .whitespacesAndNewlines)
             let simSlot = (info["simSlot"] as? Int) ?? 0
-            if !replyText.isEmpty {
-                Task { @MainActor in
-                    BridgeClient.shared.connectNow()
-                    for _ in 0..<25 where !BridgeClient.shared.isConnected {
-                        try? await Task.sleep(nanoseconds: 120_000_000)
-                    }
-                    BridgeClient.shared.sendSms(address: address, body: replyText, simSlot: simSlot)
-                }
+            guard !replyText.isEmpty else {
+                completionHandler()
+                return
             }
+            let bgToken = BgTaskToken()
+            bgToken.start(name: "SimBridgeQuickReply")
+            Task { @MainActor in
+                _ = await BridgeClient.shared.sendSmsAsync(address: address, body: replyText, simSlot: simSlot)
+                completionHandler()
+                bgToken.end()
+            }
+            return
         } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
                   let address = info["address"] as? String,
                   !address.isEmpty {

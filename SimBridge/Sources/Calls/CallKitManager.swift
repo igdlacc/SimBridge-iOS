@@ -24,6 +24,12 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var internalHoldBounceUuids: Set<UUID> = []
     private var lastHoldBounceAt: Date = .distantPast
 
+    var currentActiveAudioCallId: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeAudioCallId
+    }
+
     #if compiler(>=6.2)
     private static let bluetoothHfpOption: AVAudioSession.CategoryOptions = .allowBluetoothHFP
     #else
@@ -68,11 +74,17 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.lock()
         if let existing = uuidByCallId[callId] {
             uuid = existing
+            if let contactName, !contactName.isEmpty, contactNameByUuid[existing] == nil {
+                contactNameByUuid[existing] = contactName
+            }
         } else {
             uuid = UUID()
             uuidByCallId[callId] = uuid
             callIdByUuid[uuid] = callId
             numberByUuid[uuid] = number
+            if let contactName, !contactName.isEmpty {
+                contactNameByUuid[uuid] = contactName
+            }
             simSlotByUuid[uuid] = simSlot
             callCreatedAtByUuid[uuid] = Date()
         }
@@ -246,6 +258,22 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                     contactName: resolvedName,
                     simSlot: dto.simSlot
                 )
+            } else if let uuid {
+                lock.lock()
+                let knownName = contactNameByUuid[uuid]
+                lock.unlock()
+                if knownName == nil {
+                    let resolved = (dto.contactName?.isEmpty == false ? dto.contactName : nil)
+                        ?? ContactsHelper.shared.resolveName(for: dto.number)
+                    if let resolved, !resolved.isEmpty {
+                        lock.lock()
+                        contactNameByUuid[uuid] = resolved
+                        lock.unlock()
+                        let upd = CXCallUpdate()
+                        upd.localizedCallerName = resolved
+                        provider.reportCall(with: uuid, updated: upd)
+                    }
+                }
             }
         case "dialing":
             if let uuid, dto.direction == "outgoing" {
@@ -285,6 +313,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 if shouldReport {
                     provider.reportOutgoingCall(with: uuid, connectedAt: Date())
                 }
+            }
+            if AudioEngineManager.shared.isMuted != dto.muted {
+                AudioEngineManager.shared.setMuted(dto.muted)
             }
         case "disconnected":
             if let uuid {
@@ -525,8 +556,16 @@ final class CallKitManager: NSObject, CXProviderDelegate {
 
         if let callId {
             Task { @MainActor in
-                BridgeClient.shared.sendCommand(BridgeWsMessage(type: "answer_call", callId: callId))
                 BridgeClient.shared.startUdpSession(callId: callId)
+                let ok = await BridgeClient.shared.sendReliableCommand(
+                    BridgeWsMessage(type: "answer_call", callId: callId),
+                    timeoutSec: 6.0
+                )
+                if ok {
+                    BridgeClient.shared.startUdpSession(callId: callId)
+                } else {
+                    AudioEngineManager.shared.recordDiagnostic("answer_call reliable send timed out")
+                }
             }
         }
         action.fulfill()
@@ -545,11 +584,14 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             AudioEngineManager.shared.stop()
         }
         Task { @MainActor in
-            BridgeClient.shared.sendCommand(BridgeWsMessage(type: "reject_or_hangup", callId: callId))
             if emptyAfterRemove {
                 BridgeClient.shared.stopUdpSession()
             }
             BridgeClient.shared.handleLocalCallEnded(callId: callId)
+            _ = await BridgeClient.shared.sendReliableCommand(
+                BridgeWsMessage(type: "reject_or_hangup", callId: callId),
+                timeoutSec: 5.0
+            )
         }
         action.fulfill()
     }
@@ -561,8 +603,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.unlock()
         Task { @MainActor in
             BridgeClient.shared.updateLocalCallMuteState(callId: callId, muted: action.isMuted)
-            BridgeClient.shared.sendCommand(
-                BridgeWsMessage(type: "set_mute", callId: callId, muted: action.isMuted)
+            _ = await BridgeClient.shared.sendReliableCommand(
+                BridgeWsMessage(type: "set_mute", callId: callId, muted: action.isMuted),
+                timeoutSec: 4.0
             )
         }
         action.fulfill()
@@ -591,8 +634,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         if !isInternalBounce {
             Task { @MainActor in
                 BridgeClient.shared.updateLocalCallHoldState(callId: callId, held: action.isOnHold)
-                BridgeClient.shared.sendCommand(
-                    BridgeWsMessage(type: "set_hold", callId: callId, held: action.isOnHold)
+                _ = await BridgeClient.shared.sendReliableCommand(
+                    BridgeWsMessage(type: "set_hold", callId: callId, held: action.isOnHold),
+                    timeoutSec: 4.0
                 )
             }
         }
@@ -605,8 +649,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.unlock()
         Task { @MainActor in
             for ch in action.digits {
-                BridgeClient.shared.sendCommand(
-                    BridgeWsMessage(type: "send_dtmf", callId: callId, digit: String(ch))
+                _ = await BridgeClient.shared.sendReliableCommand(
+                    BridgeWsMessage(type: "send_dtmf", callId: callId, digit: String(ch)),
+                    timeoutSec: 3.5
                 )
             }
         }

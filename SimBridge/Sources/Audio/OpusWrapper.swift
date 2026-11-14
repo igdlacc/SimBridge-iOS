@@ -1,6 +1,6 @@
 import Foundation
 
-final class OpusWrapper {
+final class OpusWrapper: @unchecked Sendable {
     static let sampleRate: Int32 = 48_000
     static let channels: Int32 = 1
     static let frameSamples: Int32 = 960 // 20 ms

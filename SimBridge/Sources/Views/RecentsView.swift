@@ -40,8 +40,7 @@ struct RecentsView: View {
                         }
                         .listStyle(.plain)
                         .refreshable {
-                            bridge.sendCommand(BridgeWsMessage(type: "sync_request"))
-                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            await bridge.refreshSync()
                         }
                     }
                 } else {
@@ -55,7 +54,7 @@ struct RecentsView: View {
                     Button {
                         SimHaptics.tap(.light)
                         if mode == 0 {
-                            bridge.sendCommand(BridgeWsMessage(type: "sync_request"))
+                            Task { await bridge.refreshSync() }
                         } else {
                             contacts.refreshAuthorizationStatus(forceReload: true)
                         }
@@ -329,7 +328,7 @@ struct RecentsView: View {
             .font(.headline)
             if bridge.isPaired && bridge.recentCalls.isEmpty {
                 Button("Kayıtları Yenile") {
-                    bridge.sendCommand(BridgeWsMessage(type: "sync_request"))
+                    Task { await bridge.refreshSync() }
                 }
                 .buttonStyle(.bordered)
             }
