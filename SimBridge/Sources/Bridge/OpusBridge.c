@@ -20,8 +20,9 @@ SimOpusEnc *sim_opus_encoder_create(int32_t sample_rate, int32_t channels, int32
     opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
     opus_encoder_ctl(enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
     opus_encoder_ctl(enc, OPUS_SET_VBR(1));
+    opus_encoder_ctl(enc, OPUS_SET_LSB_DEPTH(16));
     opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
-    opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(5));
+    opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(10));
     opus_encoder_ctl(enc, OPUS_SET_DTX(0));
 
     SimOpusEnc *wrap = (SimOpusEnc *)malloc(sizeof(SimOpusEnc));

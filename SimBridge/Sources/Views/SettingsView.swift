@@ -5,22 +5,46 @@ struct SettingsView: View {
     @ObservedObject private var bridge = BridgeClient.shared
     @ObservedObject private var contacts = ContactsHelper.shared
     @ObservedObject private var audio = AudioEngineManager.shared
+    @ObservedObject private var notifications = NotificationManager.shared
+
     @State private var showingScanner = false
     @State private var copiedAudioLog = false
+    @State private var showFullLogs = false
+    @State private var confirmUnpair = false
+
+    private var appVersionLabel: String {
+        let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "\(ver) (\(build))"
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Köprü Bağlantısı") {
                     LabeledContent("Durum", value: bridge.statusBanner)
-                    if bridge.isPaired {
-                        LabeledContent("Eşleşen Cihaz", value: bridge.pairingDeviceName)
-                        Button("Şimdi Yeniden Bağlan") {
-                            bridge.connectNow(force: true, sweepSubnet: true)
+                    if let rtt = bridge.pingLatencyMs, bridge.isConnected {
+                        LabeledContent("Gecikme (Ping)", value: "\(rtt) ms")
+                    }
+                    if let lastSync = bridge.lastSyncAt {
+                        LabeledContent("Son Senkronizasyon") {
+                            Text(lastSync, style: .time)
+                                .foregroundStyle(.secondary)
                         }
                     }
-                    Button("QR Kod ile Eşleştir / Güncelle") {
+                    if bridge.isPaired {
+                        LabeledContent("Eşleşen Cihaz", value: bridge.pairingDeviceName)
+                        Button {
+                            SimHaptics.tap(.light)
+                            bridge.connectNow(force: true, sweepSubnet: true)
+                        } label: {
+                            Label("Şimdi Yeniden Bağlan (LAN Taraması)", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
+                    Button {
                         showingScanner = true
+                    } label: {
+                        Label("QR Kod ile Eşleştir / Güncelle", systemImage: "qrcode.viewfinder")
                     }
                 }
 
@@ -30,10 +54,14 @@ struct SettingsView: View {
                         LabeledContent("Pil", value: "\(st.batteryPct)% \(st.isCharging ? "⚡" : "")")
                         LabeledContent("Priv-App Ses Yetkisi", value: st.isPrivileged ? "Aktif ✓" : "Eksik ✕")
                         LabeledContent("InCallService", value: st.inCallServiceBound ? "Bağlı ✓" : "Arama Bekleniyor")
+                        LabeledContent("Ses Profili", value: st.audioProfile)
                         LabeledContent("Yerel IP'ler", value: st.localIps.joined(separator: ", "))
-                        LabeledContent("Ses TX/RX Paket", value: "\(st.udpTxPackets) / \(st.udpRxPackets)")
+                        LabeledContent("Android Ses TX/RX/PLC", value: "\(st.udpTxPackets) / \(st.udpRxPackets) / \(st.plcFrames)")
                         ForEach(st.sims) { sim in
-                            LabeledContent("SIM \(sim.simSlot + 1)", value: sim.carrierName)
+                            let valueText = (sim.phoneNumber?.isEmpty == false)
+                                ? "\(sim.carrierName) (\(sim.phoneNumber!))"
+                                : sim.carrierName
+                            LabeledContent("SIM \(sim.simSlot + 1)", value: valueText)
                         }
                     }
                 }
@@ -45,19 +73,38 @@ struct SettingsView: View {
                     )
                     LabeledContent(
                         "SMS Alert APNs",
-                        value: NotificationManager.shared.currentAlertTokenHex.isEmpty ? "İzin Bekliyor" : "Hazır ✓"
+                        value: notifications.currentAlertTokenHex.isEmpty ? "Bekleniyor" : "Hazır ✓"
                     )
-                    if !contacts.authorized {
+                    if notifications.authorizationStatus == .denied {
+                        Button("Bildirim İzni Kapalı — Ayarları Aç") {
+                            openSystemSettings()
+                        }
+                        .foregroundStyle(.orange)
+                    }
+
+                    if contacts.authorized {
+                        LabeledContent("Rehber", value: "\(contacts.contacts.count) kişi yüklendi ✓")
+                    } else if contacts.authorizationStatus == .denied || contacts.authorizationStatus == .restricted {
+                        Button("Rehber İzni Kapalı — Ayarları Aç") {
+                            openSystemSettings()
+                        }
+                        .foregroundStyle(.orange)
+                    } else {
                         Button("iPhone Rehberine İzin Ver") {
                             contacts.requestAccessAndLoad()
                         }
-                    } else {
-                        LabeledContent("Rehber", value: "\(contacts.contacts.count) kişi yüklendi ✓")
                     }
                 }
 
                 Section("Ses & Hoparlör") {
                     LabeledContent("Aktif Ses Rotası", value: audio.routeDescription)
+                    let m = audio.callAudioMetrics
+                    if m.txPackets > 0 || m.rxPackets > 0 {
+                        LabeledContent(
+                            "iOS Ses TX/RX/PLC",
+                            value: "\(m.txPackets) / \(m.rxPackets) / \(m.plcFrames)"
+                        )
+                    }
                     Toggle(
                         "Ses İşleme (Yankı Engelleme / AEC)",
                         isOn: Binding(
@@ -67,30 +114,62 @@ struct SettingsView: View {
                     )
                     Button(copiedAudioLog ? "Ses Tanı Logu Kopyalandı ✓" : "Ses Tanı Logunu Kopyala") {
                         UIPasteboard.general.string = audio.copyableDiagnosticsText()
+                        SimHaptics.notify(.success)
                         copiedAudioLog = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            copiedAudioLog = false
+                        }
                     }
                     if !audio.diagnosticLines.isEmpty {
-                        Text(audio.diagnosticLines.suffix(6).joined(separator: "\n"))
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                        DisclosureGroup("Son Ses Tanı Logları", isExpanded: $showFullLogs) {
+                            Text(audio.diagnosticLines.suffix(15).joined(separator: "\n"))
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
                     }
                 }
 
                 if bridge.isPaired {
                     Section {
                         Button("Eşleştirmeyi Kaldır", role: .destructive) {
-                            bridge.unpair()
+                            confirmUnpair = true
                         }
                     }
                 }
+
+                Section {
+                    LabeledContent("Sürüm", value: appVersionLabel)
+                }
             }
             .navigationTitle("Ayarlar")
+            .onAppear {
+                notifications.refreshAuthorizationStatus()
+                contacts.refreshAuthorizationStatus()
+            }
+            .confirmationDialog(
+                "Android eşleştirmesi kaldırılsın mı?",
+                isPresented: $confirmUnpair,
+                titleVisibility: .visible
+            ) {
+                Button("Eşleştirmeyi Kaldır", role: .destructive) {
+                    bridge.unpair()
+                }
+                Button("İptal", role: .cancel) {}
+            } message: {
+                Text("Anahtar ve yerel önbellek temizlenir. Yeniden kullanmak için QR kod okutmanız gerekir.")
+            }
             .sheet(isPresented: $showingScanner) {
                 QrScannerSheet { code in
                     bridge.applyQrPayload(code)
                 }
             }
+        }
+    }
+
+    private func openSystemSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
         }
     }
 }

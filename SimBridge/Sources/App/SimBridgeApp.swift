@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         _ = CallKitManager.shared
+        _ = BridgeClient.shared
         VoipPushManager.shared.start()
         NotificationManager.shared.configure()
 
@@ -127,6 +128,8 @@ struct SimBridgeApp: App {
                 .onChange(of: scenePhase) { newPhase in
                     if newPhase == .active {
                         BridgeClient.shared.handleAppBecameActive()
+                        ContactsHelper.shared.refreshAuthorizationStatus()
+                        NotificationManager.shared.refreshAuthorizationStatus()
                     }
                 }
         }
@@ -135,17 +138,26 @@ struct SimBridgeApp: App {
 
 struct MainTabView: View {
     @ObservedObject private var bridge = BridgeClient.shared
+    @ObservedObject private var router = AppRouter.shared
+
+    private var unreadSmsCount: Int {
+        bridge.smsMessages.filter { !$0.isOutgoing && !$0.isRead }.count
+    }
 
     var body: some View {
-        TabView {
+        TabView(selection: $router.selectedTab) {
             DialerView()
                 .tabItem { Label("Tuşlar", systemImage: "circle.grid.3x3.fill") }
+                .tag(AppTab.dialer)
 
             RecentsView()
                 .tabItem { Label("Aramalar", systemImage: "clock.fill") }
+                .tag(AppTab.recents)
 
             SmsView()
                 .tabItem { Label("Mesajlar", systemImage: "message.fill") }
+                .badge(unreadSmsCount)
+                .tag(AppTab.sms)
 
             SettingsView()
                 .tabItem {
@@ -154,6 +166,29 @@ struct MainTabView: View {
                         systemImage: bridge.isConnected ? "antenna.radiowaves.left.and.right" : "gear"
                     )
                 }
+                .tag(AppTab.settings)
+        }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !bridge.activeCalls.isEmpty || bridge.lastCallError != nil {
+                VStack(spacing: 6) {
+                    GlobalErrorBanner()
+                    if let active = bridge.activeCalls.first {
+                        GlobalActiveCallBar(call: active)
+                    }
+                }
+                .padding(.top, 4)
+                .padding(.bottom, 6)
+                .background(.ultraThinMaterial)
+            }
+        }
+        .sheet(isPresented: $router.activeCallSheetPresented) {
+            ActiveCallDetailSheet()
+                .presentationDetents([.medium, .large])
+        }
+        .onChange(of: bridge.activeCalls.isEmpty) { isEmpty in
+            if isEmpty && router.activeCallSheetPresented {
+                router.activeCallSheetPresented = false
+            }
         }
     }
 }

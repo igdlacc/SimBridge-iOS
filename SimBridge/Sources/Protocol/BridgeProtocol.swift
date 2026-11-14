@@ -24,13 +24,13 @@ struct CallStateDto: Codable, Identifiable, Hashable {
     let number: String
     let contactName: String?
     let direction: String
-    let state: String
+    var state: String
     let simSlot: Int
     let startedAtMs: Int64
     let connectedAtMs: Int64
     let disconnectReason: String?
-    let muted: Bool
-    let onHold: Bool
+    var muted: Bool
+    var onHold: Bool
     let audioActive: Bool
     let callHash: Int32
 

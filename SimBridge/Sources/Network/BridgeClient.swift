@@ -50,7 +50,9 @@ final class UdpAudioTransport {
             self.isConnectionFailed = false
             self.key = key
 
-            let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .udp)
+            let params = NWParameters.udp
+            params.serviceClass = .interactiveVoice
+            let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
             self.connection = conn
             self.lock.unlock()
 
@@ -79,7 +81,7 @@ final class UdpAudioTransport {
                 }
             }
             conn.start(queue: self.queue)
-            self.receiveLoop(conn: conn, key: key)
+            self.receiveLoop(conn: conn, key: key, consecutiveErrors: 0)
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + .milliseconds(1500), repeating: .milliseconds(1500))
@@ -152,16 +154,38 @@ final class UdpAudioTransport {
         }
     }
 
-    private func receiveLoop(conn: NWConnection, key: Data) {
+    private func receiveLoop(conn: NWConnection, key: Data, consecutiveErrors: Int) {
         conn.receiveMessage { [weak self] content, _, _, error in
-            guard let self, error == nil else { return }
+            guard let self else { return }
+            self.lock.lock()
+            let stillCurrent = (self.connection === conn && !self.isConnectionFailed)
+            self.lock.unlock()
+            guard stillCurrent, conn.state != .cancelled, conn.state != .failed else { return }
+
+            if let error {
+                _ = error
+                let nextErrs = consecutiveErrors + 1
+                guard nextErrs < 10 else {
+                    self.lock.lock()
+                    if self.connection === conn {
+                        self.isConnectionFailed = true
+                    }
+                    self.lock.unlock()
+                    return
+                }
+                self.queue.asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
+                    self?.receiveLoop(conn: conn, key: key, consecutiveErrors: nextErrs)
+                }
+                return
+            }
+
             if let data = content,
                let decoded = UdpAudioPacket.decode(data: data, key: key),
                decoded.type == UdpAudioPacket.typeAudio {
                 AudioEngineManager.shared.onIncomingAudioPacket(seq: decoded.seq, payload: decoded.payload)
             }
-            if conn.state != .cancelled {
-                self.receiveLoop(conn: conn, key: key)
+            if conn.state != .cancelled && conn.state != .failed {
+                self.receiveLoop(conn: conn, key: key, consecutiveErrors: 0)
             }
         }
     }
@@ -170,6 +194,40 @@ final class UdpAudioTransport {
 private struct BridgeHealthResponse: Decodable, Sendable {
     let ok: Bool
     let wsPort: Int?
+    let udpPort: Int?
+}
+
+enum PendingSmsStatus: Equatable {
+    case sending
+    case sent
+    case delivered
+    case failed(String)
+
+    var label: String {
+        switch self {
+        case .sending: return "Gönderiliyor..."
+        case .sent: return "Gönderildi ✓"
+        case .delivered: return "İletildi ✓✓"
+        case .failed: return "Gönderilemedi ✕"
+        }
+    }
+}
+
+struct PendingSmsMessage: Identifiable, Equatable {
+    let id: String
+    let address: String
+    let body: String
+    let simSlot: Int
+    let timestampMs: Int64
+    var status: PendingSmsStatus
+}
+
+private struct CachedBridgeSnapshot: Codable {
+    let recentCalls: [RecentCallDto]
+    let smsMessages: [SmsMessageDto]
+    let sims: [SimSlotDto]?
+    let deviceName: String?
+    let savedAtMs: Int64
 }
 
 @MainActor
@@ -183,9 +241,13 @@ final class BridgeClient: ObservableObject {
     @Published private(set) var activeCalls: [CallStateDto] = []
     @Published private(set) var recentCalls: [RecentCallDto] = []
     @Published private(set) var smsMessages: [SmsMessageDto] = []
+    @Published private(set) var pendingSms: [PendingSmsMessage] = []
     @Published private(set) var deviceStatus: DeviceStatusDto?
+    @Published private(set) var cachedSims: [SimSlotDto] = []
     @Published private(set) var statusBanner: String = "Eşleştirme bekleniyor"
     @Published private(set) var lastCallError: String?
+    @Published private(set) var pingLatencyMs: Int?
+    @Published private(set) var lastSyncAt: Date?
 
     private let urlSession: URLSession
     private var wsTask: URLSessionWebSocketTask?
@@ -205,6 +267,7 @@ final class BridgeClient: ObservableObject {
     private var retryTask: Task<Void, Never>?
     private var keepaliveTimer: Task<Void, Never>?
     private var errorClearTask: Task<Void, Never>?
+    private var cacheSaveTask: Task<Void, Never>?
 
     private init() {
         let cfg = URLSessionConfiguration.default
@@ -228,6 +291,7 @@ final class BridgeClient: ObservableObject {
             isPaired = true
             pairingDeviceName = stored.deviceName
             statusBanner = "Android bekleniyor..."
+            loadEncryptedCacheIfAvailable(stored: stored)
             startDiscovery()
             connectNow(candidateIps: stored.candidateIps, wsPort: stored.wsPort, udpPort: stored.udpPort)
         }
@@ -265,14 +329,113 @@ final class BridgeClient: ObservableObject {
         retryAttemptCount = 0
         lastAttemptedIps = []
         PairingStore.shared.clear()
+        clearEncryptedCache()
         isPaired = false
         isConnected = false
         connectedHost = nil
         activeCalls = []
         recentCalls = []
         smsMessages = []
+        pendingSms = []
+        cachedSims = []
         deviceStatus = nil
+        pingLatencyMs = nil
+        lastSyncAt = nil
         statusBanner = "Eşleştirme kaldırıldı"
+    }
+
+    var availableSims: [SimSlotDto] {
+        deviceStatus?.sims ?? cachedSims
+    }
+
+    func validatedSimSlot(_ preferred: Int) -> Int {
+        let sims = availableSims
+        guard !sims.isEmpty else { return max(0, preferred) }
+        if sims.contains(where: { $0.simSlot == preferred }) {
+            return preferred
+        }
+        return sims.first?.simSlot ?? 0
+    }
+
+    func handleLocalCallEnded(callId: String?) {
+        if let callId {
+            activeCalls.removeAll { $0.callId == callId }
+        } else {
+            activeCalls.removeAll()
+        }
+    }
+
+    func updateLocalCallMuteState(callId: String?, muted: Bool) {
+        if let callId, let idx = activeCalls.firstIndex(where: { $0.callId == callId }) {
+            activeCalls[idx].muted = muted
+        } else if !activeCalls.isEmpty {
+            activeCalls[0].muted = muted
+        }
+    }
+
+    func updateLocalCallHoldState(callId: String?, held: Bool) {
+        if let callId, let idx = activeCalls.firstIndex(where: { $0.callId == callId }) {
+            activeCalls[idx].onHold = held
+            activeCalls[idx].state = held ? "holding" : "active"
+        } else if !activeCalls.isEmpty {
+            activeCalls[0].onHold = held
+            activeCalls[0].state = held ? "holding" : "active"
+        }
+    }
+
+    func sendSms(address: String, body: String, simSlot: Int) {
+        let trimmedAddr = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAddr.isEmpty, !trimmedBody.isEmpty else { return }
+
+        let clientMsgId = UUID().uuidString
+        let targetSim = validatedSimSlot(simSlot)
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        let optimistic = PendingSmsMessage(
+            id: clientMsgId,
+            address: trimmedAddr,
+            body: trimmedBody,
+            simSlot: targetSim,
+            timestampMs: nowMs,
+            status: .sending
+        )
+        pendingSms.append(optimistic)
+
+        let msg = BridgeWsMessage(
+            type: "send_sms",
+            simSlot: targetSim,
+            clientMsgId: clientMsgId,
+            address: trimmedAddr,
+            body: trimmedBody
+        )
+        guard let task = wsTask, isConnected, let envStr = encodeWsEnvelope(msg) else {
+            if let idx = pendingSms.firstIndex(where: { $0.id == clientMsgId }) {
+                pendingSms[idx].status = .failed("Android bağlantısı yok")
+            }
+            reportUiError("SMS gönderilemedi: Android bağlantısı yok")
+            return
+        }
+
+        task.send(.string(envStr)) { [weak self] err in
+            guard let err else { return }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let idx = self.pendingSms.firstIndex(where: { $0.id == clientMsgId }) else { return }
+                self.pendingSms[idx].status = .failed(err.localizedDescription)
+                self.reportUiError("SMS gönderilemedi")
+            }
+        }
+    }
+
+    func retryPendingSms(id: String) {
+        guard let item = pendingSms.first(where: { $0.id == id }) else { return }
+        pendingSms.removeAll { $0.id == id }
+        sendSms(address: item.address, body: item.body, simSlot: item.simSlot)
+    }
+
+    func dismissPendingSms(id: String) {
+        pendingSms.removeAll { $0.id == id }
     }
 
     func updatePushTokens(voipToken: String? = nil, alertToken: String? = nil) {
@@ -342,6 +505,7 @@ final class BridgeClient: ObservableObject {
         udpTransport.stop()
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
+        pingLatencyMs = nil
         isConnected = false
     }
 
@@ -489,6 +653,7 @@ final class BridgeClient: ObservableObject {
     private struct ConnectOutcome: @unchecked Sendable {
         let ip: String
         let wsPort: Int
+        let udpPort: Int?
         let task: URLSessionWebSocketTask
         let firstMsg: URLSessionWebSocketTask.Message
     }
@@ -551,7 +716,7 @@ final class BridgeClient: ObservableObject {
         ip: String,
         wsPort: Int,
         timeoutNs: UInt64 = 1_200_000_000
-    ) async -> (String, Int)? {
+    ) async -> (String, Int, Int?)? {
         let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !clean.contains(":"), wsPort > 0,
               let url = URL(string: "http://\(clean):\(wsPort)/health") else {
@@ -561,7 +726,7 @@ final class BridgeClient: ObservableObject {
         req.timeoutInterval = 1.5
         req.cachePolicy = .reloadIgnoringLocalCacheData
         do {
-            return try await withThrowingTaskGroup(of: (String, Int)?.self) { group in
+            return try await withThrowingTaskGroup(of: (String, Int, Int?)?.self) { group in
                 group.addTask { [self] in
                     let (data, response) = try await self.urlSession.data(for: req)
                     guard let http = response as? HTTPURLResponse,
@@ -570,7 +735,7 @@ final class BridgeClient: ObservableObject {
                           health.ok else {
                         return nil
                     }
-                    return (clean, health.wsPort ?? wsPort)
+                    return (clean, health.wsPort ?? wsPort, health.udpPort)
                 }
                 group.addTask {
                     try await Task.sleep(nanoseconds: timeoutNs)
@@ -591,7 +756,7 @@ final class BridgeClient: ObservableObject {
         ips: [String],
         wsPort: Int,
         timeoutNs: UInt64
-    ) async -> (String, Int)? {
+    ) async -> (String, Int, Int?)? {
         var uniqueIps: [String] = []
         for ip in ips {
             let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -601,7 +766,7 @@ final class BridgeClient: ObservableObject {
         }
         guard !uniqueIps.isEmpty else { return nil }
 
-        return await withTaskGroup(of: (String, Int)?.self) { group in
+        return await withTaskGroup(of: (String, Int, Int?)?.self) { group in
             for ip in uniqueIps.prefix(8) {
                 group.addTask { [self] in
                     guard !Task.isCancelled else { return nil }
@@ -648,7 +813,7 @@ final class BridgeClient: ObservableObject {
         }
 
         // Probe /health and encrypted UDP discovery first so only ONE winning socket ever opens /ws and sends hello.
-        let winningEndpoint = await withTaskGroup(of: (String, Int)?.self) { group -> (String, Int)? in
+        let winningEndpoint = await withTaskGroup(of: (String, Int, Int?)?.self) { group -> (String, Int, Int?)? in
             if !ips.isEmpty {
                 group.addTask { [self] in
                     await self.raceHealthyHost(
@@ -663,7 +828,8 @@ final class BridgeClient: ObservableObject {
                     bridgeId: bridgeId,
                     udpPort: udpPort,
                     key: key,
-                    includeSubnetSweep: sweepSubnet
+                    includeSubnetSweep: sweepSubnet,
+                    hintIps: ips
                 )
                 guard !Task.isCancelled, !found.ips.isEmpty else { return nil }
                 let targetWs = found.wsPort ?? wsPort
@@ -677,7 +843,7 @@ final class BridgeClient: ObservableObject {
                 )
             }
 
-            var picked: (String, Int)?
+            var picked: (String, Int, Int?)?
             for await endpoint in group {
                 if let win = endpoint {
                     picked = win
@@ -693,7 +859,7 @@ final class BridgeClient: ObservableObject {
         }
 
         var winner: ConnectOutcome?
-        if let (targetIp, targetWsPort) = winningEndpoint,
+        if let (targetIp, targetWsPort, targetUdpPort) = winningEndpoint,
            let url = URL(string: "ws://\(targetIp):\(targetWsPort)/ws?auth=\(authToken)") {
             if let (task, firstMsg) = try? await connectWithTimeout(
                 url: url,
@@ -704,7 +870,7 @@ final class BridgeClient: ObservableObject {
                     task.cancel(with: .goingAway, reason: nil)
                     return
                 }
-                winner = ConnectOutcome(ip: targetIp, wsPort: targetWsPort, task: task, firstMsg: firstMsg)
+                winner = ConnectOutcome(ip: targetIp, wsPort: targetWsPort, udpPort: targetUdpPort, task: task, firstMsg: firstMsg)
             }
         }
 
@@ -719,14 +885,18 @@ final class BridgeClient: ObservableObject {
             self.isConnected = true
             self.connectedHost = win.ip
             self.statusBanner = "Bağlı (\(win.ip))"
-            PairingStore.shared.updateIps([win.ip], lastWorkingIp: win.ip, wsPort: win.wsPort)
+            PairingStore.shared.updateIps([win.ip], lastWorkingIp: win.ip, wsPort: win.wsPort, udpPort: win.udpPort)
             await self.handleWebSocketMessage(win.firstMsg, key: key)
+            if let liveCall = self.activeCalls.first(where: { $0.state == "active" || $0.state == "dialing" }) {
+                self.startUdpSession(callId: liveCall.callId)
+            }
             self.listenLoop(task: win.task, key: key)
             self.startKeepaliveLoop()
             return
         }
 
         isConnected = false
+        pingLatencyMs = nil
         retryAttemptCount += 1
         statusBanner = "Android bekleniyor (yeniden deneniyor...)"
         scheduleAutoRetry()
@@ -755,6 +925,7 @@ final class BridgeClient: ObservableObject {
                     guard self.wsTask === task else { return }
                     self.wsTask = nil
                     self.isConnected = false
+                    self.pingLatencyMs = nil
                     self.statusBanner = "Bağlantı koptu, yeniden deneniyor..."
                     try? await Task.sleep(nanoseconds: 800_000_000)
                     guard !Task.isCancelled, !self.isConnected, !self.isConnecting, self.wsTask == nil else {
@@ -779,15 +950,26 @@ final class BridgeClient: ObservableObject {
 
         switch wsMsg.type {
         case "snapshot":
+            lastSyncAt = Date()
             if let calls = wsMsg.activeCalls {
                 activeCalls = calls
                 CallKitManager.shared.reconcileActiveCalls(calls)
             }
             if let recents = wsMsg.recentCalls { recentCalls = recents }
-            if let sms = wsMsg.smsList { smsMessages = sms }
-            if let st = wsMsg.status { deviceStatus = st }
+            if let sms = wsMsg.smsList {
+                smsMessages = sms
+                reconcilePendingSms(with: sms)
+            }
+            if let st = wsMsg.status {
+                deviceStatus = st
+                cachedSims = st.sims
+            }
+            scheduleEncryptedCacheSave()
         case "device_status":
-            if let st = wsMsg.status { deviceStatus = st }
+            if let st = wsMsg.status {
+                deviceStatus = st
+                cachedSims = st.sims
+            }
         case "call_state":
             if let c = wsMsg.call {
                 CallKitManager.shared.handleRemoteCallState(c)
@@ -800,16 +982,38 @@ final class BridgeClient: ObservableObject {
                     } else {
                         activeCalls.append(c)
                     }
+                    if c.state == "active" || c.state == "dialing" {
+                        startUdpSession(callId: c.callId)
+                    }
                 }
             }
         case "sms_received":
             if let sms = wsMsg.sms {
                 if !smsMessages.contains(where: { $0.id == sms.id }) {
                     smsMessages.insert(sms, at: 0)
+                    scheduleEncryptedCacheSave()
                 }
             }
         case "sms_sent_status":
-            if wsMsg.smsStatus == "sent" || wsMsg.smsStatus == "delivered" {
+            let statusStr = wsMsg.smsStatus ?? ""
+            if let cid = wsMsg.clientMsgId,
+               let idx = pendingSms.firstIndex(where: { $0.id == cid }) {
+                switch statusStr {
+                case "sent":
+                    pendingSms[idx].status = .sent
+                case "delivered":
+                    pendingSms[idx].status = .delivered
+                case "failed":
+                    let errMsg = wsMsg.error ?? "Bilinmeyen SMS hatası"
+                    pendingSms[idx].status = .failed(errMsg)
+                    reportUiError("SMS gönderilemedi: \(errMsg)")
+                default:
+                    break
+                }
+            } else if statusStr == "failed" {
+                reportUiError("SMS gönderilemedi: \(wsMsg.error ?? "Bilinmeyen hata")")
+            }
+            if statusStr == "sent" || statusStr == "delivered" {
                 sendCommand(BridgeWsMessage(type: "sync_request"))
             }
         default:
@@ -822,9 +1026,125 @@ final class BridgeClient: ObservableObject {
         keepaliveTimer = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
-                guard let self, self.isConnected else { return }
-                self.sendCommand(BridgeWsMessage(type: "ping"))
+                guard let self, self.isConnected, let task = self.wsTask else { return }
+
+                let sentAt = Date()
+                let alive = await self.probeNativeWsPing(task: task, timeoutNs: 3_500_000_000)
+                guard !Task.isCancelled else { return }
+                if alive {
+                    self.pingLatencyMs = max(1, Int(Date().timeIntervalSince(sentAt) * 1000))
+                } else {
+                    if self.wsTask === task {
+                        task.cancel(with: .goingAway, reason: nil)
+                        self.wsTask = nil
+                        self.isConnected = false
+                        self.pingLatencyMs = nil
+                        self.statusBanner = "Bağlantı zaman aşımı, yeniden bağlanılıyor..."
+                        self.connectNow(force: true)
+                    }
+                    return
+                }
             }
+        }
+    }
+
+    private func probeNativeWsPing(task: URLSessionWebSocketTask, timeoutNs: UInt64) async -> Bool {
+        let once = OnceFlag()
+        return await withCheckedContinuation { cont in
+            let timerTask = Task {
+                try? await Task.sleep(nanoseconds: timeoutNs)
+                if once.claim() {
+                    cont.resume(returning: false)
+                }
+            }
+            task.sendPing { err in
+                timerTask.cancel()
+                if once.claim() {
+                    cont.resume(returning: err == nil)
+                }
+            }
+        }
+    }
+
+    private func reconcilePendingSms(with serverList: [SmsMessageDto]) {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        pendingSms.removeAll { pending in
+            if case .failed = pending.status {
+                return false
+            }
+            let normPending = ContactsHelper.normalizeSuffix(pending.address)
+            let trimmedBody = pending.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let matched = serverList.contains { srv in
+                guard srv.isOutgoing else { return false }
+                let timeDiff = abs(srv.timestampMs - pending.timestampMs)
+                guard timeDiff <= 120_000 else { return false }
+                let normSrv = ContactsHelper.normalizeSuffix(srv.address)
+                let sameAddr = (!normPending.isEmpty && normPending == normSrv) || srv.address == pending.address
+                return sameAddr && srv.body.trimmingCharacters(in: .whitespacesAndNewlines) == trimmedBody
+            }
+            if matched { return true }
+            return (nowMs - pending.timestampMs) > 180_000
+        }
+    }
+
+    nonisolated private static var encryptedCacheUrl: URL? {
+        guard let appSup = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return appSup.appendingPathComponent("SimBridge", isDirectory: true)
+            .appendingPathComponent("snapshot_cache_v1.enc")
+    }
+
+    private func loadEncryptedCacheIfAvailable(stored: StoredPairingConfig) {
+        guard let url = Self.encryptedCacheUrl,
+              let cipherB64 = try? String(contentsOf: url, encoding: .utf8),
+              let key = BridgeCrypto.decodeBase64Url(stored.keyB64),
+              let plain = try? BridgeCrypto.decryptStringGcm(cipherB64, key: key),
+              let data = plain.data(using: .utf8),
+              let snap = try? JSONDecoder().decode(CachedBridgeSnapshot.self, from: data) else {
+            return
+        }
+        recentCalls = snap.recentCalls
+        smsMessages = snap.smsMessages
+        if let sims = snap.sims { cachedSims = sims }
+        if snap.savedAtMs > 0 {
+            lastSyncAt = Date(timeIntervalSince1970: Double(snap.savedAtMs) / 1000.0)
+        }
+    }
+
+    private func scheduleEncryptedCacheSave() {
+        cacheSaveTask?.cancel()
+        guard let stored = PairingStore.shared.load(),
+              let key = BridgeCrypto.decodeBase64Url(stored.keyB64) else {
+            return
+        }
+        let snapshot = CachedBridgeSnapshot(
+            recentCalls: Array(recentCalls.prefix(80)),
+            smsMessages: Array(smsMessages.prefix(160)),
+            sims: deviceStatus?.sims ?? (cachedSims.isEmpty ? nil : cachedSims),
+            deviceName: deviceStatus?.deviceName ?? pairingDeviceName,
+            savedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        cacheSaveTask = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled,
+                  let url = Self.encryptedCacheUrl,
+                  let jsonData = try? JSONEncoder().encode(snapshot),
+                  let jsonStr = String(data: jsonData, encoding: .utf8),
+                  let enc = try? BridgeCrypto.encryptStringGcm(jsonStr, key: key) else {
+                return
+            }
+            let dir = url.deletingLastPathComponent()
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? enc.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func clearEncryptedCache() {
+        cacheSaveTask?.cancel()
+        cacheSaveTask = nil
+        if let url = Self.encryptedCacheUrl {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 

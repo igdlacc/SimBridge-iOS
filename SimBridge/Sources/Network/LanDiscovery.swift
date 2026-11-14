@@ -97,7 +97,8 @@ enum LanDiscovery {
         bridgeId: String,
         udpPort: Int,
         key: Data,
-        includeSubnetSweep: Bool
+        includeSubnetSweep: Bool,
+        hintIps: [String] = []
     ) async -> DiscoveryResult {
         guard udpPort > 0, udpPort <= Int(UInt16.max) else { return .empty }
         return await withCheckedContinuation { cont in
@@ -107,7 +108,8 @@ enum LanDiscovery {
                         bridgeId: bridgeId,
                         udpPort: UInt16(udpPort),
                         key: key,
-                        includeSubnetSweep: includeSubnetSweep
+                        includeSubnetSweep: includeSubnetSweep,
+                        hintIps: hintIps
                     )
                 )
             }
@@ -118,7 +120,8 @@ enum LanDiscovery {
         bridgeId: String,
         udpPort: UInt16,
         key: Data,
-        includeSubnetSweep: Bool
+        includeSubnetSweep: Bool,
+        hintIps: [String]
     ) -> DiscoveryResult {
         let ifaces = activeLanInterfaces()
         guard !ifaces.isEmpty else { return .empty }
@@ -173,6 +176,14 @@ enum LanDiscovery {
                 appendUniqueTarget(gw, into: &fastTargets)
             }
         }
+        for hint in hintIps {
+            if let ipVal = parseIpv4(hint) {
+                let onLocalSubnet = ifaces.contains { (ipVal & $0.maskHostOrder) == ($0.addrHostOrder & $0.maskHostOrder) && ipVal != $0.addrHostOrder }
+                if onLocalSubnet {
+                    appendUniqueTarget(ipVal, into: &fastTargets)
+                }
+            }
+        }
         appendUniqueTarget(0xFFFFFFFF, into: &fastTargets)
 
         sendProbe(fd: fd, targets: fastTargets, port: udpPort, packet: reqWire)
@@ -185,10 +196,19 @@ enum LanDiscovery {
                 let net = iface.addrHostOrder & iface.maskHostOrder
                 let bcast = net | ~iface.maskHostOrder
                 let hostCount = bcast > (net + 1) ? (bcast - net - 1) : 0
-                guard hostCount >= 1, hostCount <= 510 else { continue }
-                for host in (net + 1)..<bcast where !seen.contains(host) {
-                    seen.insert(host)
-                    sweepTargets.append(host)
+                if hostCount >= 1 && hostCount <= 510 {
+                    for host in (net + 1)..<bcast where !seen.contains(host) {
+                        seen.insert(host)
+                        sweepTargets.append(host)
+                    }
+                } else if hostCount > 510 {
+                    // On large (/16../22) Wi-Fi networks, still sweep the adjacent /24 slice safely.
+                    let sliceNet = iface.addrHostOrder & 0xFFFFFF00
+                    let sliceBcast = sliceNet | 0xFF
+                    for host in (sliceNet + 1)..<sliceBcast where !seen.contains(host) {
+                        seen.insert(host)
+                        sweepTargets.append(host)
+                    }
                 }
             }
         }
@@ -279,6 +299,15 @@ enum LanDiscovery {
                 }
             }
         }
+    }
+
+    private static func parseIpv4(_ str: String) -> UInt32? {
+        var addr = in_addr()
+        let clean = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, inet_pton(AF_INET, clean, &addr) == 1 else {
+            return nil
+        }
+        return UInt32(bigEndian: addr.s_addr)
     }
 
     private static func ipv4String(_ ipHostOrder: UInt32) -> String {

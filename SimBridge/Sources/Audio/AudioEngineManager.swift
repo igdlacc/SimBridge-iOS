@@ -3,13 +3,25 @@ import Combine
 import Foundation
 import UIKit
 
+struct AudioCallMetrics: Equatable, Sendable {
+    var txPackets: Int64 = 0
+    var rxPackets: Int64 = 0
+    var plcFrames: Int64 = 0
+    var lateDropFrames: Int64 = 0
+    var queuedFrames: Int = 0
+
+    static let empty = AudioCallMetrics()
+}
+
 final class AudioEngineManager: ObservableObject {
     static let shared = AudioEngineManager()
 
     @Published private(set) var isSpeakerOn: Bool = false
+    @Published private(set) var isMuted: Bool = false
     @Published private(set) var routeDescription: String = "Beklemede"
     @Published private(set) var diagnosticLines: [String] = []
     @Published private(set) var voiceProcessingEnabled: Bool = AudioEngineManager.loadVoiceProcessingPreference()
+    @Published private(set) var callAudioMetrics: AudioCallMetrics = .empty
 
     private let stateLock = NSLock()
     private let diagLock = NSLock()
@@ -33,6 +45,7 @@ final class AudioEngineManager: ObservableObject {
     private var appDidEnterBgObserver: NSObjectProtocol?
     private var configChangeWorkItem: DispatchWorkItem?
     private var recoveryWorkItem: DispatchWorkItem?
+    private var metricsTimer: DispatchSourceTimer?
     private var opus: OpusWrapper?
     private var diagnosticBuffer: [String] = []
     private var lastKnownSpeakerActive = false
@@ -62,10 +75,12 @@ final class AudioEngineManager: ObservableObject {
     )!
 
     private let txRingLock = NSLock()
-    private var txFloatBuffer: [Float] = []
+    private let txRing = RingFloatBuffer(capacity: 16_384)
+    private var txScratchPcm = [Int16](repeating: 0, count: Int(OpusWrapper.frameSamples))
+    private var txOpusScratch = [UInt8](repeating: 0, count: OpusWrapper.maxPacketBytes)
 
     private let rxRingLock = NSLock()
-    private var rxFloatBuffer: [Float] = []
+    private let rxRing = RingFloatBuffer(capacity: 16_384)
     private var rxScratchPcm = [Int16](repeating: 0, count: Int(OpusWrapper.frameSamples))
 
     private var isRunning = false
@@ -75,10 +90,11 @@ final class AudioEngineManager: ObservableObject {
     private var recoveryGeneration: Int = 0
     private var probeAttemptCount: Int = 0
     private var appIsActiveCached = false
-    private var isMuted = false
+    private var isMutedLocked = false
     private var activeCallHash: Int32 = 0
     private var txSeq: UInt16 = 0
     private var txTimestamp: UInt32 = 0
+    private var txPacketCount: Int64 = 0
     private var onSendAudioPacket: ((Data, UInt16, UInt32, Int32) -> Void)?
 
     private init() {
@@ -140,7 +156,11 @@ final class AudioEngineManager: ObservableObject {
 
     func copyableDiagnosticsText() -> String {
         let session = AVAudioSession.sharedInstance()
-        let header = "cat=\(session.category.rawValue) mode=\(session.mode.rawValue) opts=\(session.categoryOptions.rawValue) sr=\(Int(session.sampleRate))Hz vpPref=\(Self.loadVoiceProcessingPreference()) otherAudio=\(session.isOtherAudioPlaying) route=[\(Self.describeRoute(session.currentRoute))]"
+        let jbStats = jitterBuffer.statsSnapshot()
+        stateLock.lock()
+        let txCnt = txPacketCount
+        stateLock.unlock()
+        let header = "cat=\(session.category.rawValue) mode=\(session.mode.rawValue) opts=\(session.categoryOptions.rawValue) sr=\(Int(session.sampleRate))Hz vpPref=\(Self.loadVoiceProcessingPreference()) otherAudio=\(session.isOtherAudioPlaying) tx=\(txCnt) rx=\(jbStats.receivedFrames) plc=\(jbStats.plcFrames) late=\(jbStats.lateDropFrames) ovf=\(jbStats.overflowDropFrames) route=[\(Self.describeRoute(session.currentRoute))]"
         diagLock.lock()
         let lines = diagnosticBuffer
         diagLock.unlock()
@@ -588,10 +608,10 @@ final class AudioEngineManager: ObservableObject {
                     converter = nil
                     lastInputFormat = nil
                     rxRingLock.lock()
-                    rxFloatBuffer.removeAll(keepingCapacity: true)
+                    rxRing.removeAll()
                     rxRingLock.unlock()
                     txRingLock.lock()
-                    txFloatBuffer.removeAll(keepingCapacity: true)
+                    txRing.removeAll()
                     txRingLock.unlock()
                     jitterBuffer.reset()
                     isInterrupted = false
@@ -658,8 +678,55 @@ final class AudioEngineManager: ObservableObject {
 
     func setMuted(_ muted: Bool) {
         stateLock.lock()
-        isMuted = muted
+        isMutedLocked = muted
         stateLock.unlock()
+        DispatchQueue.main.async {
+            if self.isMuted != muted {
+                self.isMuted = muted
+            }
+        }
+    }
+
+    private func startMetricsTimerLocked() {
+        metricsTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: routeSessionQueue)
+        timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.publishAudioMetrics()
+        }
+        metricsTimer = timer
+        timer.resume()
+    }
+
+    private func stopMetricsTimerLocked() {
+        metricsTimer?.cancel()
+        metricsTimer = nil
+    }
+
+    private func publishAudioMetrics() {
+        stateLock.lock()
+        let running = isRunning
+        let txCnt = txPacketCount
+        stateLock.unlock()
+
+        let snapshot: AudioCallMetrics
+        if running {
+            let jb = jitterBuffer.statsSnapshot()
+            snapshot = AudioCallMetrics(
+                txPackets: txCnt,
+                rxPackets: jb.receivedFrames,
+                plcFrames: jb.plcFrames,
+                lateDropFrames: jb.lateDropFrames,
+                queuedFrames: jb.queuedFrames
+            )
+        } else {
+            snapshot = .empty
+        }
+        DispatchQueue.main.async {
+            if self.callAudioMetrics != snapshot {
+                self.callAudioMetrics = snapshot
+            }
+        }
     }
 
     func updateCallHash(_ callId: String) {
@@ -695,31 +762,40 @@ final class AudioEngineManager: ObservableObject {
         recoveryGeneration &+= 1
 
         if opus == nil {
-            guard let codec = OpusWrapper(bitrateBps: 24_000, complexity: 6) else {
+            guard let codec = OpusWrapper(bitrateBps: 32_000, complexity: 7) else {
                 isRunning = false
                 return
             }
             opus = codec
         }
-        jitterBuffer.reset()
+        if !isRunning {
+            jitterBuffer.resetAllStats()
+            txSeq = 0
+            txTimestamp = 0
+            txPacketCount = 0
+            isMutedLocked = false
+            DispatchQueue.main.async {
+                self.isMuted = false
+                self.callAudioMetrics = .empty
+            }
+        } else {
+            jitterBuffer.reset()
+        }
 
         txRingLock.lock()
-        txFloatBuffer.removeAll(keepingCapacity: true)
+        txRing.removeAll()
         txRingLock.unlock()
 
         rxRingLock.lock()
-        rxFloatBuffer.removeAll(keepingCapacity: true)
+        rxRing.removeAll()
         rxRingLock.unlock()
 
         converter = nil
         lastInputFormat = nil
-        if !isRunning {
-            txSeq = 0
-            txTimestamp = 0
-        }
 
         isRunning = true
         holdBounceAttemptedInEpisode = false
+        startMetricsTimerLocked()
 
         if !inputsReady {
             isInterrupted = true
@@ -888,8 +964,10 @@ final class AudioEngineManager: ObservableObject {
             return
         }
 
+        stopMetricsTimerLocked()
         isRunning = false
         isInterrupted = false
+        isMutedLocked = false
         speakerBeforeInterruption = false
         holdBounceAttemptedInEpisode = false
         probeAttemptCount = 0
@@ -897,6 +975,10 @@ final class AudioEngineManager: ObservableObject {
         opus = nil
         jitterBuffer.reset()
         onSendAudioPacket = nil
+        DispatchQueue.main.async {
+            self.isMuted = false
+            self.callAudioMetrics = .empty
+        }
     }
 
     func stop() {
@@ -906,13 +988,19 @@ final class AudioEngineManager: ObservableObject {
         recoveryWorkItem?.cancel()
         recoveryWorkItem = nil
         recoveryGeneration &+= 1
+        stopMetricsTimerLocked()
 
         let wasActive = isRunning || engine != nil || opus != nil
         isRunning = false
         isInterrupted = false
+        isMutedLocked = false
         speakerBeforeInterruption = false
         holdBounceAttemptedInEpisode = false
         probeAttemptCount = 0
+        DispatchQueue.main.async {
+            self.isMuted = false
+            self.callAudioMetrics = .empty
+        }
 
         guard wasActive else { return }
 
@@ -1075,9 +1163,30 @@ final class AudioEngineManager: ObservableObject {
         let mCount = Int(audioBufferList.pointee.mNumberBuffers)
         guard mCount > 0 else { return }
 
+        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
+        if mCount == 1,
+           format.sampleRate == 48_000,
+           format.channelCount == 1,
+           format.commonFormat == .pcmFormatFloat32,
+           let buf = abl.first,
+           let mData = buf.mData,
+           buf.mDataByteSize > 0 {
+            let expectedBytes = min(Int(buf.mDataByteSize), frames * MemoryLayout<Float>.size)
+            guard expectedBytes >= MemoryLayout<Float>.size else { return }
+            let rawCopy = Data(bytes: mData, count: expectedBytes)
+            txEncodeQueue.async { [weak self] in
+                guard let self else { return }
+                let sampleCount = rawCopy.count / MemoryLayout<Float>.size
+                rawCopy.withUnsafeBytes { raw in
+                    guard let floatPtr = raw.bindMemory(to: Float.self).baseAddress else { return }
+                    self.pushConvertedSamplesAndEncode(floatPtr, sampleCount: sampleCount)
+                }
+            }
+            return
+        }
+
         var copied: [Data] = []
         copied.reserveCapacity(mCount)
-        let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
         for i in 0..<abl.count {
             let buf = abl[i]
             let byteCount = Int(buf.mDataByteSize)
@@ -1105,8 +1214,58 @@ final class AudioEngineManager: ObservableObject {
     }
 
     private func processMicInput(_ buffer: AVAudioPCMBuffer) {
+        if buffer.format.sampleRate == 48_000,
+           buffer.format.channelCount == 1,
+           buffer.format.commonFormat == .pcmFormatFloat32,
+           let ch0 = buffer.floatChannelData?[0] {
+            pushConvertedSamplesAndEncode(ch0, sampleCount: Int(buffer.frameLength))
+            return
+        }
+
+        let needsNewConverter: Bool
+        if let prev = lastInputFormat {
+            needsNewConverter =
+                prev.sampleRate != buffer.format.sampleRate ||
+                prev.channelCount != buffer.format.channelCount ||
+                prev.commonFormat != buffer.format.commonFormat ||
+                prev.isInterleaved != buffer.format.isInterleaved
+        } else {
+            needsNewConverter = true
+        }
+        if converter == nil || needsNewConverter {
+            converter = AVAudioConverter(from: buffer.format, to: target48kMonoFloat)
+            lastInputFormat = buffer.format
+        }
+        guard let conv = converter else { return }
+        let ratio = 48_000.0 / max(8_000.0, buffer.format.sampleRate)
+        let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 64)
+        guard let outBuf = AVAudioPCMBuffer(pcmFormat: target48kMonoFloat, frameCapacity: cap) else { return }
+
+        var consumed = false
+        var err: NSError?
+        let status = conv.convert(to: outBuf, error: &err) { _, outStatus in
+            if consumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        if status == .error || err != nil {
+            converter?.reset()
+            converter = nil
+            return
+        }
+        guard outBuf.frameLength > 0, let ch0 = outBuf.floatChannelData?[0] else { return }
+        pushConvertedSamplesAndEncode(ch0, sampleCount: Int(outBuf.frameLength))
+    }
+
+    private func pushConvertedSamplesAndEncode(_ samples: UnsafePointer<Float>, sampleCount: Int) {
+        guard sampleCount > 0 else { return }
+
         stateLock.lock()
-        let muted = isMuted
+        let muted = isMutedLocked
         let running = isRunning
         let codec = opus
         let callHash = activeCallHash
@@ -1115,82 +1274,34 @@ final class AudioEngineManager: ObservableObject {
 
         guard running, let codec, let sender else { return }
 
-        let convertedSamples: [Float]
-        if buffer.format.sampleRate == 48_000,
-           buffer.format.channelCount == 1,
-           buffer.format.commonFormat == .pcmFormatFloat32,
-           let ch0 = buffer.floatChannelData?[0] {
-            let count = Int(buffer.frameLength)
-            convertedSamples = Array(UnsafeBufferPointer(start: ch0, count: count))
-        } else {
-            let needsNewConverter: Bool
-            if let prev = lastInputFormat {
-                needsNewConverter =
-                    prev.sampleRate != buffer.format.sampleRate ||
-                    prev.channelCount != buffer.format.channelCount ||
-                    prev.commonFormat != buffer.format.commonFormat ||
-                    prev.isInterleaved != buffer.format.isInterleaved
-            } else {
-                needsNewConverter = true
-            }
-            if converter == nil || needsNewConverter {
-                converter = AVAudioConverter(from: buffer.format, to: target48kMonoFloat)
-                lastInputFormat = buffer.format
-            }
-            guard let conv = converter else { return }
-            let ratio = 48_000.0 / max(8_000.0, buffer.format.sampleRate)
-            let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 64)
-            guard let outBuf = AVAudioPCMBuffer(pcmFormat: target48kMonoFloat, frameCapacity: cap) else { return }
-
-            var consumed = false
-            var err: NSError?
-            let status = conv.convert(to: outBuf, error: &err) { _, outStatus in
-                if consumed {
-                    outStatus.pointee = .noDataNow
-                    return nil
-                }
-                consumed = true
-                outStatus.pointee = .haveData
-                return buffer
-            }
-            if status == .error || err != nil {
-                converter?.reset()
-                converter = nil
-                return
-            }
-            guard outBuf.frameLength > 0, let ch0 = outBuf.floatChannelData?[0] else { return }
-            convertedSamples = Array(UnsafeBufferPointer(start: ch0, count: Int(outBuf.frameLength)))
-        }
-
         let frameLen = Int(OpusWrapper.frameSamples)
-        var framesToSend: [[Int16]] = []
-
         txRingLock.lock()
-        txFloatBuffer.append(contentsOf: convertedSamples)
-        while txFloatBuffer.count >= frameLen {
-            var pcm = [Int16](repeating: 0, count: frameLen)
-            if !muted {
-                for i in 0..<frameLen {
-                    let clipped = max(-1.0, min(1.0, txFloatBuffer[i]))
-                    pcm[i] = Int16(clipped * 32767.0)
-                }
+        txRing.push(samples, count: sampleCount)
+        while true {
+            let popped = txScratchPcm.withUnsafeMutableBufferPointer { ptr -> Bool in
+                guard let base = ptr.baseAddress else { return false }
+                return txRing.popFrameAsInt16(into: base, count: frameLen, muted: muted)
             }
-            txFloatBuffer.removeFirst(frameLen)
-            framesToSend.append(pcm)
-        }
-        txRingLock.unlock()
+            if !popped { break }
+            txRingLock.unlock()
 
-        for pcm in framesToSend {
-            if let encoded = codec.encode(pcm: pcm) {
+            let encoded = txScratchPcm.withUnsafeBufferPointer { pcmPtr -> Data? in
+                guard let base = pcmPtr.baseAddress else { return nil }
+                return codec.encode(pcm: base, sampleCount: frameLen, scratchOut: &txOpusScratch)
+            }
+            if let encoded {
                 stateLock.lock()
                 let seq = txSeq
                 let ts = txTimestamp
                 txSeq = txSeq &+ 1
                 txTimestamp = txTimestamp &+ UInt32(OpusWrapper.frameSamples)
+                txPacketCount += 1
                 stateLock.unlock()
                 sender(encoded, seq, ts, callHash)
             }
+            txRingLock.lock()
         }
+        txRingLock.unlock()
     }
 
     private func fillOutputSamples(dst: UnsafeMutablePointer<Float>, count: Int) {
@@ -1198,47 +1309,51 @@ final class AudioEngineManager: ObservableObject {
         defer { rxRingLock.unlock() }
 
         let frameLen = Int(OpusWrapper.frameSamples)
+        // Guard against unbounded latency buildup after audio route/BT stalls (cap at ~160ms).
+        if rxRing.count > 7680 {
+            rxRing.dropOldest(rxRing.count - 3840)
+        }
+
         if let codec = opus {
-            while rxFloatBuffer.count < count {
+            while rxRing.count < count {
                 let res = jitterBuffer.pop()
                 switch res {
                 case .frame(let payload, let useFec):
                     let decCount = codec.decode(packet: payload, pcmOut: &rxScratchPcm, decodeFec: useFec)
                     if decCount > 0 {
-                        for i in 0..<Int(decCount) {
-                            rxFloatBuffer.append(Float(rxScratchPcm[i]) / 32768.0)
+                        rxScratchPcm.withUnsafeBufferPointer { ptr in
+                            if let base = ptr.baseAddress {
+                                rxRing.pushInt16Scaled(base, count: Int(decCount))
+                            }
                         }
                     } else {
-                        rxFloatBuffer.append(contentsOf: repeatElement(Float(0), count: frameLen))
+                        rxRing.pushZeros(count: frameLen)
                     }
                 case .missingPlc:
                     let decCount = codec.decode(packet: nil, pcmOut: &rxScratchPcm, decodeFec: false)
                     if decCount > 0 {
-                        for i in 0..<Int(decCount) {
-                            rxFloatBuffer.append(Float(rxScratchPcm[i]) / 32768.0)
+                        rxScratchPcm.withUnsafeBufferPointer { ptr in
+                            if let base = ptr.baseAddress {
+                                rxRing.pushInt16Scaled(base, count: Int(decCount))
+                            }
                         }
                     } else {
-                        rxFloatBuffer.append(contentsOf: repeatElement(Float(0), count: frameLen))
+                        rxRing.pushZeros(count: frameLen)
                     }
                 case .underrunSilence:
-                    rxFloatBuffer.append(contentsOf: repeatElement(Float(0), count: count))
-                    break
+                    // Zero-fill only the remaining samples directly in `dst` instead of queuing excess silence.
+                    let avail = rxRing.pop(into: dst, count: count)
+                    if avail < count {
+                        dst.advanced(by: avail).update(repeating: 0, count: count - avail)
+                    }
+                    return
                 }
-                if case .underrunSilence = res { break }
             }
         }
 
-        let avail = min(count, rxFloatBuffer.count)
-        for i in 0..<avail {
-            dst[i] = rxFloatBuffer[i]
-        }
+        let avail = rxRing.pop(into: dst, count: count)
         if avail < count {
-            for i in avail..<count {
-                dst[i] = 0
-            }
-        }
-        if avail > 0 {
-            rxFloatBuffer.removeFirst(avail)
+            dst.advanced(by: avail).update(repeating: 0, count: count - avail)
         }
     }
 }

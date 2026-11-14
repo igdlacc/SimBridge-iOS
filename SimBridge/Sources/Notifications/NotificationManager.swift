@@ -2,13 +2,23 @@ import Foundation
 import UIKit
 import UserNotifications
 
-final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
+final class NotificationManager: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationManager()
 
+    @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     private(set) var currentAlertTokenHex: String = ""
 
     private override init() {
         super.init()
+    }
+
+    func refreshAuthorizationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let status = settings.authorizationStatus
+            DispatchQueue.main.async {
+                self.authorizationStatus = status
+            }
+        }
     }
 
     func configure() {
@@ -44,6 +54,7 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
         center.setNotificationCategories([otpCategory, msgCategory])
 
         center.requestAuthorization(options: [.alert, .sound, .badge, .timeSensitive]) { granted, _ in
+            self.refreshAuthorizationStatus()
             if granted {
                 DispatchQueue.main.async {
                     UIApplication.shared.registerForRemoteNotifications()
@@ -86,17 +97,17 @@ final class NotificationManager: NSObject, UNUserNotificationCenterDelegate {
             if !replyText.isEmpty {
                 Task { @MainActor in
                     BridgeClient.shared.connectNow()
-                    try? await Task.sleep(nanoseconds: 400_000_000)
-                    BridgeClient.shared.sendCommand(
-                        BridgeWsMessage(
-                            type: "send_sms",
-                            simSlot: simSlot,
-                            clientMsgId: UUID().uuidString,
-                            address: address,
-                            body: replyText
-                        )
-                    )
+                    for _ in 0..<25 where !BridgeClient.shared.isConnected {
+                        try? await Task.sleep(nanoseconds: 120_000_000)
+                    }
+                    BridgeClient.shared.sendSms(address: address, body: replyText, simSlot: simSlot)
                 }
+            }
+        } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+                  let address = info["address"] as? String,
+                  !address.isEmpty {
+            Task { @MainActor in
+                AppRouter.shared.openSmsConversation(address: address)
             }
         }
         completionHandler()

@@ -12,6 +12,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var uuidByCallId: [String: UUID] = [:]
     private var callIdByUuid: [UUID: String] = [:]
     private var numberByUuid: [UUID: String] = [:]
+    private var contactNameByUuid: [UUID: String] = [:]
     private var simSlotByUuid: [UUID: Int] = [:]
     private var callCreatedAtByUuid: [UUID: Date] = [:]
     private var outgoingUuids: Set<UUID> = []
@@ -135,6 +136,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         uuidByCallId[callId] = uuid
         callIdByUuid[uuid] = callId
         numberByUuid[uuid] = clean
+        if let contactName, !contactName.isEmpty {
+            contactNameByUuid[uuid] = contactName
+        }
         simSlotByUuid[uuid] = simSlot
         callCreatedAtByUuid[uuid] = now
         outgoingUuids.insert(uuid)
@@ -156,15 +160,60 @@ final class CallKitManager: NSObject, CXProviderDelegate {
 
     func endCall(callId: String) {
         lock.lock()
-        let uuid = uuidByCallId[callId]
+        let uuid = uuidByCallId[callId] ?? activeAudioCallId.flatMap { uuidByCallId[$0] } ?? callIdByUuid.keys.first
+        lock.unlock()
+        guard let uuid else {
+            Task { @MainActor in
+                BridgeClient.shared.handleLocalCallEnded(callId: callId)
+            }
+            return
+        }
+        callController.request(CXTransaction(action: CXEndCallAction(call: uuid))) { _ in }
+    }
+
+    func answerCall(callId: String) {
+        lock.lock()
+        let uuid = uuidByCallId[callId] ?? callIdByUuid.keys.first
         lock.unlock()
         guard let uuid else { return }
-        callController.request(CXTransaction(action: CXEndCallAction(call: uuid))) { _ in }
+        callController.request(CXTransaction(action: CXAnswerCallAction(call: uuid))) { _ in }
+    }
+
+    func setMuted(callId: String? = nil, muted: Bool) {
+        lock.lock()
+        let uuid = callId.flatMap { uuidByCallId[$0] }
+            ?? activeAudioCallId.flatMap { uuidByCallId[$0] }
+            ?? callIdByUuid.keys.first
+        lock.unlock()
+        guard let uuid else { return }
+        let action = CXSetMutedCallAction(call: uuid, muted: muted)
+        callController.request(CXTransaction(action: action)) { err in
+            if let err {
+                let nsErr = err as NSError
+                AudioEngineManager.shared.recordDiagnostic("CallKit setMuted ERR domain=\(nsErr.domain) code=\(nsErr.code)")
+            }
+        }
+    }
+
+    func setHeld(callId: String? = nil, held: Bool) {
+        lock.lock()
+        let uuid = callId.flatMap { uuidByCallId[$0] }
+            ?? activeAudioCallId.flatMap { uuidByCallId[$0] }
+            ?? callIdByUuid.keys.first
+        lock.unlock()
+        guard let uuid else { return }
+        let action = CXSetHeldCallAction(call: uuid, onHold: held)
+        callController.request(CXTransaction(action: action)) { err in
+            if let err {
+                let nsErr = err as NSError
+                AudioEngineManager.shared.recordDiagnostic("CallKit setHeld ERR domain=\(nsErr.domain) code=\(nsErr.code)")
+            }
+        }
     }
 
     func sendDtmf(callId: String, digits: String) {
         lock.lock()
-        let uuid = uuidByCallId[callId]
+        let uuid = uuidByCallId[callId] ?? activeAudioCallId.flatMap { uuidByCallId[$0] } ?? callIdByUuid.keys.first
         lock.unlock()
         guard let uuid else { return }
         let action = CXPlayDTMFCallAction(call: uuid, digits: digits, type: .singleTone)
@@ -206,9 +255,22 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                     reportedConnectingUuids.insert(uuid)
                     shouldReport = true
                 }
+                let knownName = contactNameByUuid[uuid]
                 lock.unlock()
                 if shouldReport {
                     provider.reportOutgoingCall(with: uuid, startedConnectingAt: Date())
+                }
+                if knownName == nil {
+                    let resolved = (dto.contactName?.isEmpty == false ? dto.contactName : nil)
+                        ?? ContactsHelper.shared.resolveName(for: dto.number)
+                    if let resolved, !resolved.isEmpty {
+                        lock.lock()
+                        contactNameByUuid[uuid] = resolved
+                        lock.unlock()
+                        let upd = CXCallUpdate()
+                        upd.localizedCallerName = resolved
+                        provider.reportCall(with: uuid, updated: upd)
+                    }
                 }
             }
         case "active":
@@ -278,9 +340,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
 
     func failCallIfStillTracked(uuid: UUID) {
         lock.lock()
-        let tracked = callIdByUuid[uuid] != nil
+        let cid = callIdByUuid[uuid]
         lock.unlock()
-        guard tracked else { return }
+        guard cid != nil else { return }
 
         provider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
         removeMapping(uuid: uuid)
@@ -292,6 +354,11 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             AudioEngineManager.shared.stop()
             Task { @MainActor in
                 BridgeClient.shared.stopUdpSession()
+                BridgeClient.shared.handleLocalCallEnded(callId: cid)
+            }
+        } else if let cid {
+            Task { @MainActor in
+                BridgeClient.shared.handleLocalCallEnded(callId: cid)
             }
         }
     }
@@ -304,6 +371,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         AudioEngineManager.shared.clearCallRouteState()
         Task { @MainActor in
             BridgeClient.shared.stopUdpSession()
+            BridgeClient.shared.handleLocalCallEnded(callId: nil)
         }
         lock.lock()
         clearAllMappingsLocked()
@@ -416,6 +484,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         configureAudioSession(source: "start_action")
         lock.lock()
         let number = numberByUuid[action.callUUID] ?? action.handle.value
+        let contactName = contactNameByUuid[action.callUUID]
         let simSlot = simSlotByUuid[action.callUUID] ?? 0
         let cid = callIdByUuid[action.callUUID] ?? action.callUUID.uuidString
         outgoingUuids.insert(action.callUUID)
@@ -424,6 +493,10 @@ final class CallKitManager: NSObject, CXProviderDelegate {
 
         action.fulfill()
         let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .phoneNumber, value: number)
+        if let contactName, !contactName.isEmpty {
+            update.localizedCallerName = contactName
+        }
         update.supportsHolding = true
         update.supportsGrouping = false
         update.supportsDTMF = true
@@ -465,10 +538,18 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.unlock()
         removeMapping(uuid: action.callUUID)
 
-        AudioEngineManager.shared.stop()
+        lock.lock()
+        let emptyAfterRemove = callIdByUuid.isEmpty
+        lock.unlock()
+        if emptyAfterRemove {
+            AudioEngineManager.shared.stop()
+        }
         Task { @MainActor in
             BridgeClient.shared.sendCommand(BridgeWsMessage(type: "reject_or_hangup", callId: callId))
-            BridgeClient.shared.stopUdpSession()
+            if emptyAfterRemove {
+                BridgeClient.shared.stopUdpSession()
+            }
+            BridgeClient.shared.handleLocalCallEnded(callId: callId)
         }
         action.fulfill()
     }
@@ -479,6 +560,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         let callId = callIdByUuid[action.callUUID]
         lock.unlock()
         Task { @MainActor in
+            BridgeClient.shared.updateLocalCallMuteState(callId: callId, muted: action.isMuted)
             BridgeClient.shared.sendCommand(
                 BridgeWsMessage(type: "set_mute", callId: callId, muted: action.isMuted)
             )
@@ -508,6 +590,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         }
         if !isInternalBounce {
             Task { @MainActor in
+                BridgeClient.shared.updateLocalCallHoldState(callId: callId, held: action.isOnHold)
                 BridgeClient.shared.sendCommand(
                     BridgeWsMessage(type: "set_hold", callId: callId, held: action.isOnHold)
                 )
@@ -649,6 +732,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             if activeAudioCallId == cid { activeAudioCallId = nil }
         }
         numberByUuid.removeValue(forKey: uuid)
+        contactNameByUuid.removeValue(forKey: uuid)
         simSlotByUuid.removeValue(forKey: uuid)
         callCreatedAtByUuid.removeValue(forKey: uuid)
         outgoingUuids.remove(uuid)
@@ -664,6 +748,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         uuidByCallId.removeAll()
         callIdByUuid.removeAll()
         numberByUuid.removeAll()
+        contactNameByUuid.removeAll()
         simSlotByUuid.removeAll()
         callCreatedAtByUuid.removeAll()
         outgoingUuids.removeAll()

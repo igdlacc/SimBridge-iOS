@@ -4,8 +4,11 @@ import UIKit
 struct DialerView: View {
     @ObservedObject private var bridge = BridgeClient.shared
     @ObservedObject private var contacts = ContactsHelper.shared
+    @ObservedObject private var router = AppRouter.shared
+    @AppStorage("simbridge.preferredSimSlot") private var selectedSimSlot: Int = 0
+
     @State private var numberText: String = ""
-    @State private var selectedSimSlot: Int = 0
+    @State private var copiedBanner: Bool = false
 
     private let keys: [[(String, String)]] = [
         [("1", ""), ("2", "ABC"), ("3", "DEF")],
@@ -14,66 +17,116 @@ struct DialerView: View {
         [("*", ""), ("0", "+"), ("#", "")]
     ]
 
+    private var matchingContacts: [SimpleContact] {
+        guard numberText.count >= 2, contacts.authorized else { return [] }
+        return contacts.matchingContacts(for: numberText, limit: 3)
+    }
+
+    private var exactContactName: String? {
+        guard !numberText.isEmpty else { return nil }
+        return contacts.resolveName(for: numberText)
+    }
+
+    private var clipboardDialableNumber: String? {
+        guard numberText.isEmpty, let clip = UIPasteboard.general.string else { return nil }
+        let filtered = BridgeFormatters.filterDialable(clip)
+        return filtered.count >= 3 ? filtered : nil
+    }
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: 14) {
+            VStack(spacing: 10) {
                 ConnectionStatusPill()
+                SimSelectorBar(selectedSimSlot: $selectedSimSlot)
 
-                if let err = bridge.lastCallError {
-                    Text(err)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(Color.red.opacity(0.9))
-                        .clipShape(Capsule())
-                        .padding(.horizontal)
-                }
+                Spacer(minLength: 4)
 
-                if let active = bridge.activeCalls.first {
-                    ActiveCallCard(call: active)
-                }
-
-                if let sims = bridge.deviceStatus?.sims, sims.count > 1 {
-                    Picker("SIM Seçimi", selection: $selectedSimSlot) {
-                        ForEach(sims) { sim in
-                            Text("SIM \(sim.simSlot + 1) • \(sim.carrierName)").tag(sim.simSlot)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .padding(.horizontal)
-                }
-
-                Spacer()
-
-                VStack(spacing: 4) {
+                VStack(spacing: 6) {
                     Text(numberText.isEmpty ? "Numara Girin" : numberText)
                         .font(.system(size: 32, weight: .medium, design: .rounded))
                         .lineLimit(1)
-                        .minimumScaleFactor(0.5)
+                        .minimumScaleFactor(0.45)
                         .foregroundStyle(numberText.isEmpty ? .secondary : .primary)
                         .padding(.horizontal)
+                        .contextMenu {
+                            if !numberText.isEmpty {
+                                Button {
+                                    UIPasteboard.general.string = numberText
+                                    copiedBanner = true
+                                } label: {
+                                    Label("Numarayı Kopyala", systemImage: "doc.on.doc")
+                                }
+                                Button(role: .destructive) {
+                                    numberText = ""
+                                } label: {
+                                    Label("Temizle", systemImage: "trash")
+                                }
+                            }
+                            if let clip = UIPasteboard.general.string {
+                                let filtered = BridgeFormatters.filterDialable(clip)
+                                if !filtered.isEmpty {
+                                    Button {
+                                        numberText = filtered
+                                    } label: {
+                                        Label("Yapıştır (\(filtered))", systemImage: "doc.on.clipboard")
+                                    }
+                                }
+                            }
+                        }
 
-                    if let name = contacts.resolveName(for: numberText), !numberText.isEmpty {
+                    if let name = exactContactName {
                         Text(name)
-                            .font(.subheadline)
+                            .font(.subheadline.weight(.medium))
                             .foregroundStyle(.green)
-                    }
-                }
-                .contentShape(Rectangle())
-                .onLongPressGesture {
-                    if let clip = UIPasteboard.general.string {
-                        numberText = clip.filter { $0.isNumber || $0 == "+" || $0 == "*" || $0 == "#" }
+                    } else if let clipNum = clipboardDialableNumber {
+                        Button {
+                            SimHaptics.tap(.light)
+                            numberText = clipNum
+                        } label: {
+                            Label("Panodan Yapıştır: \(clipNum)", systemImage: "doc.on.clipboard")
+                                .font(.caption.weight(.medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    } else if !matchingContacts.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(matchingContacts) { c in
+                                    if let num = c.numbers.first {
+                                        Button {
+                                            SimHaptics.tap(.light)
+                                            numberText = BridgeFormatters.filterDialable(num)
+                                        } label: {
+                                            HStack(spacing: 4) {
+                                                Text(c.name).font(.caption.weight(.semibold))
+                                                Text(num).font(.caption2).foregroundStyle(.secondary)
+                                            }
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(Color(.secondarySystemBackground))
+                                            .clipShape(Capsule())
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    } else {
+                        Text(" ")
+                            .font(.subheadline)
+                            .hidden()
                     }
                 }
 
-                Spacer()
+                Spacer(minLength: 4)
 
-                VStack(spacing: 14) {
+                VStack(spacing: 12) {
                     ForEach(0..<keys.count, id: \.self) { row in
-                        HStack(spacing: 22) {
+                        HStack(spacing: 20) {
                             ForEach(keys[row], id: \.0) { digit, sub in
                                 Button {
+                                    SimHaptics.tap(.light)
                                     numberText.append(digit)
                                     if let active = bridge.activeCalls.first(where: { $0.state == "active" }) {
                                         CallKitManager.shared.sendDtmf(callId: active.callId, digits: digit)
@@ -88,14 +141,15 @@ struct DialerView: View {
                                                 .foregroundStyle(.secondary)
                                         }
                                     }
-                                    .frame(width: 76, height: 76)
+                                    .frame(width: 72, height: 72)
                                     .background(Color(.secondarySystemBackground))
                                     .clipShape(Circle())
                                 }
                                 .buttonStyle(.plain)
                                 .simultaneousGesture(
-                                    LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                                    LongPressGesture(minimumDuration: 0.45).onEnded { _ in
                                         if digit == "0" {
+                                            SimHaptics.tap(.medium)
                                             if numberText.hasSuffix("0") { numberText.removeLast() }
                                             numberText.append("+")
                                         }
@@ -106,117 +160,86 @@ struct DialerView: View {
                     }
                 }
 
-                HStack(spacing: 36) {
-                    Color.clear.frame(width: 64, height: 64)
+                HStack(spacing: 32) {
+                    if !numberText.isEmpty && bridge.isPaired {
+                        Button {
+                            SimHaptics.tap(.light)
+                            router.openSmsConversation(address: numberText, title: exactContactName)
+                        } label: {
+                            Image(systemName: "message.fill")
+                                .font(.title3)
+                                .foregroundStyle(.blue)
+                                .frame(width: 60, height: 60)
+                                .background(Color(.secondarySystemBackground))
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("SMS Gönder")
+                    } else {
+                        Color.clear.frame(width: 60, height: 60)
+                    }
 
                     Button {
                         guard !numberText.isEmpty else { return }
-                        let name = contacts.resolveName(for: numberText)
+                        SimHaptics.tap(.medium)
+                        let validSim = bridge.validatedSimSlot(selectedSimSlot)
                         CallKitManager.shared.startOutgoingCall(
                             number: numberText,
-                            contactName: name,
-                            simSlot: selectedSimSlot
+                            contactName: exactContactName,
+                            simSlot: validSim
                         )
                     } label: {
                         Image(systemName: "phone.fill")
                             .font(.title2)
                             .foregroundStyle(.white)
                             .frame(width: 72, height: 72)
-                            .background(
-                                !bridge.isPaired || numberText.isEmpty
-                                    ? Color.gray
-                                    : (bridge.isConnected ? Color.green : Color.orange)
-                            )
+                            .background(callButtonColor)
                             .clipShape(Circle())
                     }
                     .disabled(!bridge.isPaired || numberText.isEmpty)
 
                     Button {
+                        SimHaptics.tap(.light)
                         if !numberText.isEmpty { numberText.removeLast() }
                     } label: {
                         Image(systemName: "delete.left")
                             .font(.title2)
-                            .frame(width: 64, height: 64)
+                            .frame(width: 60, height: 60)
                     }
                     .disabled(numberText.isEmpty)
                     .simultaneousGesture(
-                        LongPressGesture(minimumDuration: 0.6).onEnded { _ in
+                        LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                            SimHaptics.tap(.medium)
                             numberText = ""
                         }
                     )
                 }
                 .padding(.top, 4)
-                .padding(.bottom, 12)
+                .padding(.bottom, 10)
             }
             .navigationTitle("Tuşlar")
             .navigationBarTitleDisplayMode(.inline)
+            .overlay(alignment: .bottom) {
+                if copiedBanner {
+                    Text("Numara kopyalandı")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.ultraThinMaterial)
+                        .clipShape(Capsule())
+                        .padding(.bottom, 16)
+                        .onAppear {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                                copiedBanner = false
+                            }
+                        }
+                }
+            }
         }
     }
-}
 
-struct ActiveCallCard: View {
-    let call: CallStateDto
-    @ObservedObject private var audio = AudioEngineManager.shared
-
-    var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(call.contactName ?? call.number)
-                    .font(.headline)
-                Text("SIM \(call.simSlot + 1) • \(call.state.uppercased()) • \(audio.routeDescription)")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-            }
-            Spacer()
-            Button {
-                audio.setSpeakerEnabled(!audio.isSpeakerOn)
-            } label: {
-                Label(
-                    audio.isSpeakerOn ? "Ahize" : "Hoparlör",
-                    systemImage: audio.isSpeakerOn ? "speaker.wave.3.fill" : "speaker.wave.2"
-                )
-                .font(.caption.bold())
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(audio.isSpeakerOn ? .blue : .secondary)
-
-            Button(role: .destructive) {
-                CallKitManager.shared.endCall(callId: call.callId)
-            } label: {
-                Label("Kapat", systemImage: "phone.down.fill")
-                    .font(.caption.bold())
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-        }
-        .padding(12)
-        .background(Color.green.opacity(0.14))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .padding(.horizontal)
-    }
-}
-
-struct ConnectionStatusPill: View {
-    @ObservedObject private var bridge = BridgeClient.shared
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(bridge.isConnected ? Color.green : Color.orange)
-                .frame(width: 9, height: 9)
-            Text(bridge.statusBanner)
-                .font(.caption.weight(.medium))
-            Spacer()
-            if let st = bridge.deviceStatus {
-                Text("🔋 \(st.batteryPct)%")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Color(.secondarySystemBackground))
-        .clipShape(Capsule())
-        .padding(.horizontal)
+    private var callButtonColor: Color {
+        if !bridge.isPaired || numberText.isEmpty { return .gray }
+        return bridge.isConnected ? .green : .orange
     }
 }

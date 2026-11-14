@@ -30,29 +30,43 @@ enum UdpAudioPacket {
         salt: UInt32,
         nonceCounter: UInt64
     ) -> Data? {
-        var header = Data(capacity: 8)
-        header.append(contentsOf: magic)
-        header.append(type)
-        header.append(direction)
-        var seqBE = seq.bigEndian
-        header.append(Data(bytes: &seqBE, count: 2))
+        var header = [UInt8](repeating: 0, count: 8)
+        header[0] = magic[0]
+        header[1] = magic[1]
+        header[2] = magic[2]
+        header[3] = magic[3]
+        header[4] = type
+        header[5] = direction
+        header[6] = UInt8((seq >> 8) & 0xFF)
+        header[7] = UInt8(seq & 0xFF)
 
-        var nonceData = Data(capacity: 12)
-        nonceData.append(direction)
-        nonceData.append(UInt8((salt >> 16) & 0xFF))
-        nonceData.append(UInt8((salt >> 8) & 0xFF))
-        nonceData.append(UInt8(salt & 0xFF))
-        var cntBE = nonceCounter.bigEndian
-        nonceData.append(Data(bytes: &cntBE, count: 8))
+        var nonceBytes = [UInt8](repeating: 0, count: 12)
+        nonceBytes[0] = direction
+        nonceBytes[1] = UInt8((salt >> 16) & 0xFF)
+        nonceBytes[2] = UInt8((salt >> 8) & 0xFF)
+        nonceBytes[3] = UInt8(salt & 0xFF)
+        for i in 0..<8 {
+            nonceBytes[4 + i] = UInt8((nonceCounter >> ((7 - i) * 8)) & 0xFF)
+        }
 
-        var inner = Data(capacity: 8 + payload.count)
-        var tsBE = timestampSamples.bigEndian
-        var hashBE = UInt32(bitPattern: callHash).bigEndian
-        inner.append(Data(bytes: &tsBE, count: 4))
-        inner.append(Data(bytes: &hashBE, count: 4))
-        inner.append(payload)
+        var inner = Data(count: 8 + payload.count)
+        let hashBits = UInt32(bitPattern: callHash)
+        inner.withUnsafeMutableBytes { raw in
+            guard let ptr = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            ptr[0] = UInt8((timestampSamples >> 24) & 0xFF)
+            ptr[1] = UInt8((timestampSamples >> 16) & 0xFF)
+            ptr[2] = UInt8((timestampSamples >> 8) & 0xFF)
+            ptr[3] = UInt8(timestampSamples & 0xFF)
+            ptr[4] = UInt8((hashBits >> 24) & 0xFF)
+            ptr[5] = UInt8((hashBits >> 16) & 0xFF)
+            ptr[6] = UInt8((hashBits >> 8) & 0xFF)
+            ptr[7] = UInt8(hashBits & 0xFF)
+            if !payload.isEmpty {
+                payload.copyBytes(to: ptr.advanced(by: 8), count: payload.count)
+            }
+        }
 
-        guard let nonce = try? AES.GCM.Nonce(data: nonceData),
+        guard let nonce = try? AES.GCM.Nonce(data: nonceBytes),
               let sealed = try? AES.GCM.seal(
                 inner,
                 using: SymmetricKey(data: key),
@@ -63,37 +77,46 @@ enum UdpAudioPacket {
             return nil
         }
 
-        var out = Data(capacity: header.count + combined.count)
-        out.append(header)
+        var out = Data(capacity: 8 + combined.count)
+        out.append(contentsOf: header)
         out.append(combined)
         return out
     }
 
     static func decode(data: Data, key: Data) -> Decoded? {
         guard data.count >= 8 + 12 + 8 + 16 else { return nil }
-        guard data[0] == magic[0], data[1] == magic[1], data[2] == magic[2], data[3] == magic[3] else {
+        let start = data.startIndex
+        guard data[start] == magic[0],
+              data[start + 1] == magic[1],
+              data[start + 2] == magic[2],
+              data[start + 3] == magic[3] else {
             return nil
         }
 
-        let header = data.subdata(in: 0..<8)
-        let combined = data.subdata(in: 8..<data.count)
+        let header = data[start..<(start + 8)]
+        let combined = data[(start + 8)..<data.endIndex]
         guard let box = try? AES.GCM.SealedBox(combined: combined),
               let plain = try? AES.GCM.open(box, using: SymmetricKey(data: key), authenticating: header),
               plain.count >= 8 else {
             return nil
         }
 
-        let type = header[4]
-        let direction = header[5]
-        let seq = (UInt16(header[6]) << 8) | UInt16(header[7])
+        let type = data[start + 4]
+        let direction = data[start + 5]
+        let seq = (UInt16(data[start + 6]) << 8) | UInt16(data[start + 7])
 
-        let ts = plain.subdata(in: 0..<4).withUnsafeBytes {
-            UInt32(bigEndian: $0.load(as: UInt32.self))
-        }
-        let hashRaw = plain.subdata(in: 4..<8).withUnsafeBytes {
-            UInt32(bigEndian: $0.load(as: UInt32.self))
-        }
-        let payload = plain.subdata(in: 8..<plain.count)
+        let pStart = plain.startIndex
+        let ts =
+            (UInt32(plain[pStart]) << 24) |
+            (UInt32(plain[pStart + 1]) << 16) |
+            (UInt32(plain[pStart + 2]) << 8) |
+            UInt32(plain[pStart + 3])
+        let hashRaw =
+            (UInt32(plain[pStart + 4]) << 24) |
+            (UInt32(plain[pStart + 5]) << 16) |
+            (UInt32(plain[pStart + 6]) << 8) |
+            UInt32(plain[pStart + 7])
+        let payload = plain[(pStart + 8)..<plain.endIndex]
 
         return Decoded(
             type: type,

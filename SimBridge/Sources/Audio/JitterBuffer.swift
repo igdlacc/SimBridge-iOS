@@ -7,6 +7,14 @@ final class JitterBuffer {
         case underrunSilence
     }
 
+    struct Stats: Equatable, Sendable {
+        var receivedFrames: Int64 = 0
+        var plcFrames: Int64 = 0
+        var lateDropFrames: Int64 = 0
+        var overflowDropFrames: Int64 = 0
+        var queuedFrames: Int = 0
+    }
+
     private let lock = NSLock()
     private let targetDepthFrames: Int
     private let maxDepthFrames: Int
@@ -15,16 +23,32 @@ final class JitterBuffer {
     private var nextSeq: UInt16 = 0
     private var consecutiveMisses = 0
 
+    private(set) var receivedCount: Int64 = 0
     private(set) var plcCount: Int64 = 0
+    private(set) var lateDropCount: Int64 = 0
+    private(set) var overflowDropCount: Int64 = 0
 
     init(targetDepthFrames: Int = 3, maxDepthFrames: Int = 10) {
         self.targetDepthFrames = targetDepthFrames
         self.maxDepthFrames = maxDepthFrames
     }
 
+    func statsSnapshot() -> Stats {
+        lock.lock()
+        defer { lock.unlock() }
+        return Stats(
+            receivedFrames: receivedCount,
+            plcFrames: plcCount,
+            lateDropFrames: lateDropCount,
+            overflowDropFrames: overflowDropCount,
+            queuedFrames: buffer.count
+        )
+    }
+
     func push(seq: UInt16, payload: Data) {
         lock.lock()
         defer { lock.unlock() }
+        receivedCount += 1
 
         if !started {
             if buffer.isEmpty {
@@ -47,7 +71,9 @@ final class JitterBuffer {
                 nextSeq = seq
                 started = false
                 consecutiveMisses = 0
+                return
             }
+            lateDropCount += 1
             return
         }
 
@@ -67,6 +93,7 @@ final class JitterBuffer {
             if Self.seqDiff(oldest, nextSeq) >= 0 {
                 nextSeq = oldest &+ 1
             }
+            overflowDropCount += 1
         }
     }
 
@@ -108,6 +135,19 @@ final class JitterBuffer {
         started = false
         nextSeq = 0
         consecutiveMisses = 0
+    }
+
+    func resetAllStats() {
+        lock.lock()
+        defer { lock.unlock() }
+        buffer.removeAll(keepingCapacity: true)
+        started = false
+        nextSeq = 0
+        consecutiveMisses = 0
+        receivedCount = 0
+        plcCount = 0
+        lateDropCount = 0
+        overflowDropCount = 0
     }
 
     private func findOldestKey() -> UInt16? {

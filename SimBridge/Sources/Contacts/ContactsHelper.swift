@@ -13,18 +13,23 @@ final class ContactsHelper: ObservableObject {
 
     @Published private(set) var contacts: [SimpleContact] = []
     @Published private(set) var authorized: Bool = false
+    @Published private(set) var authorizationStatus: CNAuthorizationStatus = .notDetermined
 
     private let store = CNContactStore()
     private var suffixIndex: [String: String] = [:]
+    private var hasLoadedOnce = false
 
     private init() {
         refreshAuthorizationStatus()
     }
 
-    func refreshAuthorizationStatus() {
+    func refreshAuthorizationStatus(forceReload: Bool = false) {
         let status = CNContactStore.authorizationStatus(for: .contacts)
-        authorized = (status == .authorized)
-        if authorized {
+        authorizationStatus = status
+        let isAuth = (status == .authorized)
+        authorized = isAuth
+        if isAuth && (!hasLoadedOnce || forceReload) {
+            hasLoadedOnce = true
             loadContacts()
         }
     }
@@ -32,10 +37,37 @@ final class ContactsHelper: ObservableObject {
     func requestAccessAndLoad() {
         store.requestAccess(for: .contacts) { [weak self] granted, _ in
             Task { @MainActor in
+                let status = CNContactStore.authorizationStatus(for: .contacts)
+                self?.authorizationStatus = status
                 self?.authorized = granted
-                if granted { self?.loadContacts() }
+                if granted {
+                    self?.hasLoadedOnce = true
+                    self?.loadContacts()
+                }
             }
         }
+    }
+
+    func matchingContacts(for query: String, limit: Int = 5) -> [SimpleContact] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let digitQuery = trimmed.filter { $0.isNumber }
+        var hits: [SimpleContact] = []
+        for contact in contacts {
+            let nameMatch = contact.name.localizedCaseInsensitiveContains(trimmed)
+            let numberMatch = contact.numbers.contains { num in
+                if num.localizedCaseInsensitiveContains(trimmed) { return true }
+                if digitQuery.count >= 3 {
+                    return num.filter { $0.isNumber }.contains(digitQuery)
+                }
+                return false
+            }
+            if nameMatch || numberMatch {
+                hits.append(contact)
+                if hits.count >= limit { break }
+            }
+        }
+        return hits
     }
 
     func resolveName(for number: String) -> String? {
