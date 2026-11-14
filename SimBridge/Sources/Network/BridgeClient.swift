@@ -763,7 +763,7 @@ final class BridgeClient: ObservableObject {
     }
 
     @discardableResult
-    func sendReliableCommand(_ message: BridgeWsMessage, timeoutSec: Double = 5.0) async -> Bool {
+    func sendReliableCommand(_ message: BridgeWsMessage, timeoutSec: Double = 6.5) async -> Bool {
         guard isPaired, let envStr = encodeWsEnvelope(message) else {
             return false
         }
@@ -812,7 +812,7 @@ final class BridgeClient: ObservableObject {
                 completion(false)
                 return
             }
-            let ok = await self.sendReliableCommand(message, timeoutSec: 5.5)
+            let ok = await self.sendReliableCommand(message, timeoutSec: 7.5)
             completion(ok)
         }
     }
@@ -861,10 +861,10 @@ final class BridgeClient: ObservableObject {
     nonisolated private func connectWithTimeout(
         url: URL,
         helloEnvStr: String,
-        timeoutNs: UInt64 = 2_000_000_000
+        timeoutNs: UInt64 = 4_000_000_000
     ) async throws -> (URLSessionWebSocketTask, URLSessionWebSocketTask.Message) {
         var req = URLRequest(url: url)
-        req.timeoutInterval = 2.5
+        req.timeoutInterval = max(3.0, Double(timeoutNs) / 1_000_000_000.0 + 0.5)
         let task = urlSession.webSocketTask(with: req)
         task.resume()
         do {
@@ -893,7 +893,7 @@ final class BridgeClient: ObservableObject {
     nonisolated private func probeHealth(
         ip: String,
         wsPort: Int,
-        timeoutNs: UInt64 = 1_200_000_000
+        timeoutNs: UInt64 = 1_500_000_000
     ) async -> (String, Int, Int?)? {
         let clean = ip.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !clean.contains(":"), wsPort > 0,
@@ -901,7 +901,7 @@ final class BridgeClient: ObservableObject {
             return nil
         }
         var req = URLRequest(url: url)
-        req.timeoutInterval = 1.5
+        req.timeoutInterval = max(1.8, Double(timeoutNs) / 1_000_000_000.0 + 0.4)
         req.cachePolicy = .reloadIgnoringLocalCacheData
         do {
             return try await withThrowingTaskGroup(of: (String, Int, Int?)?.self) { group in
@@ -991,13 +991,15 @@ final class BridgeClient: ObservableObject {
         }
 
         // Probe /health and encrypted UDP discovery first so only ONE winning socket ever opens /ws and sends hello.
+        // Give known paired IPs a 3.0s ceiling so cold Wi-Fi beacon + kernel suspend resume succeeds on attempt #1
+        // (still resolves in ~5ms whenever Android is already awake).
         let winningEndpoint = await withTaskGroup(of: (String, Int, Int?)?.self) { group -> (String, Int, Int?)? in
             if !ips.isEmpty {
                 group.addTask { [self] in
                     await self.raceHealthyHost(
                         ips: ips,
                         wsPort: wsPort,
-                        timeoutNs: 1_200_000_000
+                        timeoutNs: 3_000_000_000
                     )
                 }
             }
@@ -1017,7 +1019,7 @@ final class BridgeClient: ObservableObject {
                 return await self.raceHealthyHost(
                     ips: found.ips,
                     wsPort: targetWs,
-                    timeoutNs: 1_200_000_000
+                    timeoutNs: 2_000_000_000
                 )
             }
 
@@ -1042,7 +1044,7 @@ final class BridgeClient: ObservableObject {
             if let (task, firstMsg) = try? await connectWithTimeout(
                 url: url,
                 helloEnvStr: envStr,
-                timeoutNs: 2_000_000_000
+                timeoutNs: 4_000_000_000
             ) {
                 if Task.isCancelled {
                     task.cancel(with: .goingAway, reason: nil)
