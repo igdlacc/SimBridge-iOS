@@ -813,7 +813,7 @@ struct SmsComposeSheet: View {
                     TextField("Ad veya numara (+905...)", text: $recipientQuery)
                         .keyboardType(.phonePad)
                         .onChange(of: recipientQuery) { _ in
-                            if let selectedContactName, !recipientQuery.isEmpty {
+                            if selectedContactName != nil, !recipientQuery.isEmpty {
                                 // Clear matched contact badge if user manually edits the number.
                                 let dialable = BridgeFormatters.filterDialable(recipientQuery)
                                 if dialable != recipientQuery {

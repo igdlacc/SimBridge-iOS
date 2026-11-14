@@ -104,31 +104,34 @@ final class ContactsHelper: ObservableObject {
                 CNContactOrganizationNameKey as CNKeyDescriptor,
                 CNContactPhoneNumbersKey as CNKeyDescriptor
             ]
-            var loaded: [SimpleContact] = []
-            var idx: [String: String] = [:]
-            let req = CNContactFetchRequest(keysToFetch: keys)
-            try? CNContactStore().enumerateContacts(with: req) { c, _ in
-                let fullName = [c.givenName, c.familyName].filter { !$0.isEmpty }.joined(separator: " ")
-                    .ifEmpty(c.organizationName)
-                let nums = c.phoneNumbers.map { $0.value.stringValue }.filter { !$0.isEmpty }
-                guard !fullName.isEmpty, !nums.isEmpty else { return }
-                loaded.append(SimpleContact(id: c.identifier, name: fullName, numbers: nums))
-                for n in nums {
-                    let sfx = Self.normalizeSuffix(n)
-                    if sfx.count >= 7 {
-                        idx[sfx] = fullName
+            let (sortedContacts, finalIndex): ([SimpleContact], [String: String]) = {
+                var loaded: [SimpleContact] = []
+                var idx: [String: String] = [:]
+                let req = CNContactFetchRequest(keysToFetch: keys)
+                try? CNContactStore().enumerateContacts(with: req) { c, _ in
+                    let fullName = [c.givenName, c.familyName].filter { !$0.isEmpty }.joined(separator: " ")
+                        .ifEmpty(c.organizationName)
+                    let nums = c.phoneNumbers.map { $0.value.stringValue }.filter { !$0.isEmpty }
+                    guard !fullName.isEmpty, !nums.isEmpty else { return }
+                    loaded.append(SimpleContact(id: c.identifier, name: fullName, numbers: nums))
+                    for n in nums {
+                        let sfx = Self.normalizeSuffix(n)
+                        if sfx.count >= 7 {
+                            idx[sfx] = fullName
+                        }
                     }
                 }
-            }
-            loaded.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                loaded.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                return (loaded, idx)
+            }()
             await MainActor.run {
-                self.contacts = loaded
-                self.suffixIndex = idx
+                self.contacts = sortedContacts
+                self.suffixIndex = finalIndex
             }
         }
     }
 
-    static func normalizeSuffix(_ number: String) -> String {
+    nonisolated static func normalizeSuffix(_ number: String) -> String {
         let digits = number.filter { $0.isNumber }
         return String(digits.suffix(10))
     }

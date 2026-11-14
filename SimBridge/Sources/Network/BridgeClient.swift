@@ -3,7 +3,7 @@ import Network
 import UIKit
 
 /// Off-MainActor real-time UDP audio transport so CoreAudio/Opus threads never contend on @MainActor.
-final class UdpAudioTransport {
+final class UdpAudioTransport: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.simbridge.udp", qos: .userInteractive)
     private let lock = NSLock()
     private var connection: NWConnection?
@@ -160,7 +160,13 @@ final class UdpAudioTransport {
             self.lock.lock()
             let stillCurrent = (self.connection === conn && !self.isConnectionFailed)
             self.lock.unlock()
-            guard stillCurrent, conn.state != .cancelled, conn.state != .failed else { return }
+            guard stillCurrent else { return }
+            switch conn.state {
+            case .cancelled, .failed:
+                return
+            default:
+                break
+            }
 
             if let error {
                 _ = error
@@ -251,7 +257,8 @@ final class BridgeClient: ObservableObject {
 
     private let urlSession: URLSession
     private var wsTask: URLSessionWebSocketTask?
-    private let udpTransport = UdpAudioTransport()
+    private nonisolated static let audioTransport = UdpAudioTransport()
+    private nonisolated var udpTransport: UdpAudioTransport { Self.audioTransport }
     private var bonjourBrowser: NWBrowser?
     private var pathMonitor: NWPathMonitor?
     private var foregroundObserver: NSObjectProtocol?
@@ -563,14 +570,18 @@ final class BridgeClient: ObservableObject {
         udpTransport.stop()
     }
 
-    nonisolated func sendOpusFrame(encoded: Data, seq: UInt16, ts: UInt32, callHash: Int32) {
-        udpTransport.sendPacket(
+    nonisolated static func sendOpusFrame(encoded: Data, seq: UInt16, ts: UInt32, callHash: Int32) {
+        audioTransport.sendPacket(
             type: UdpAudioPacket.typeAudio,
             seq: seq,
             timestampSamples: ts,
             callHash: callHash,
             payload: encoded
         )
+    }
+
+    nonisolated func sendOpusFrame(encoded: Data, seq: UInt16, ts: UInt32, callHash: Int32) {
+        Self.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
     }
 
     private func encodeWsEnvelope(_ message: BridgeWsMessage) -> String? {

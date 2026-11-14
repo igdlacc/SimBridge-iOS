@@ -87,7 +87,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         update.supportsDTMF = true
 
         provider.reportNewIncomingCall(with: uuid, update: update) { err in
-            if let err {
+            if err != nil {
                 self.removeMapping(uuid: uuid)
             }
             completion?(err)
@@ -625,7 +625,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.unlock()
 
         audio.start(callId: cid) { encoded, seq, ts, callHash in
-            BridgeClient.shared.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
+            BridgeClient.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
         }
     }
 
