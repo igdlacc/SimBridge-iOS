@@ -154,19 +154,22 @@ final class UdpAudioTransport: @unchecked Sendable {
         }
     }
 
+    private static func isTerminalState(_ state: NWConnection.State) -> Bool {
+        switch state {
+        case .cancelled, .failed:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func receiveLoop(conn: NWConnection, key: Data, consecutiveErrors: Int) {
         conn.receiveMessage { [weak self] content, _, _, error in
             guard let self else { return }
             self.lock.lock()
             let stillCurrent = (self.connection === conn && !self.isConnectionFailed)
             self.lock.unlock()
-            guard stillCurrent else { return }
-            switch conn.state {
-            case .cancelled, .failed:
-                return
-            default:
-                break
-            }
+            guard stillCurrent, !Self.isTerminalState(conn.state) else { return }
 
             if let error {
                 _ = error
@@ -190,7 +193,7 @@ final class UdpAudioTransport: @unchecked Sendable {
                decoded.type == UdpAudioPacket.typeAudio {
                 AudioEngineManager.shared.onIncomingAudioPacket(seq: decoded.seq, payload: decoded.payload)
             }
-            if conn.state != .cancelled && conn.state != .failed {
+            if !Self.isTerminalState(conn.state) {
                 self.receiveLoop(conn: conn, key: key, consecutiveErrors: 0)
             }
         }
