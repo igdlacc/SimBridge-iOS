@@ -87,6 +87,7 @@ struct BridgeWsMessage: Codable {
     var voipToken: String? = nil
     var alertToken: String? = nil
     var clientName: String? = nil
+    var clientForeground: Bool? = nil
     var callId: String? = nil
     var number: String? = nil
     var simSlot: Int? = nil

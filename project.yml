@@ -42,6 +42,6 @@ targets:
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-lopus"
-        MARKETING_VERSION: "1.1.3"
-        CURRENT_PROJECT_VERSION: "5"
+        MARKETING_VERSION: "1.1.4"
+        CURRENT_PROJECT_VERSION: "6"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

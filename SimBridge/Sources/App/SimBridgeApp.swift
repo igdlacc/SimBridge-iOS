@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ = BridgeClient.shared
         VoipPushManager.shared.start()
         NotificationManager.shared.configure()
+        LocationKeepAliveManager.shared.startIfAuthorized()
 
         application.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
         for identifier in Set(Self.permittedRefreshIdentifiers) {
@@ -216,10 +217,14 @@ struct SimBridgeApp: App {
                 }
                 .onChange(of: scenePhase) { newPhase in
                     if newPhase == .active {
+                        BridgeClient.shared.setAppForegroundState(true)
                         BridgeClient.shared.handleAppBecameActive()
                         ContactsHelper.shared.refreshAuthorizationStatus()
                         NotificationManager.shared.refreshAuthorizationStatus()
+                        LocationKeepAliveManager.shared.refreshAuthorizationState()
                     } else if newPhase == .background {
+                        BridgeClient.shared.setAppForegroundState(false)
+                        LocationKeepAliveManager.shared.startIfAuthorized()
                         AppDelegate.scheduleAppRefresh()
                     }
                 }

@@ -1,3 +1,4 @@
+import CoreLocation
 import SwiftUI
 import UIKit
 
@@ -6,6 +7,7 @@ struct SettingsView: View {
     @ObservedObject private var contacts = ContactsHelper.shared
     @ObservedObject private var audio = AudioEngineManager.shared
     @ObservedObject private var notifications = NotificationManager.shared
+    @ObservedObject private var locationKeepAlive = LocationKeepAliveManager.shared
 
     @State private var showingScanner = false
     @State private var copiedAudioLog = false
@@ -28,6 +30,38 @@ struct SettingsView: View {
             return "Kısıtlı"
         @unknown default:
             return "Bilinmiyor"
+        }
+    }
+
+    private var locationStatusLabel: String {
+        if !locationKeepAlive.isEnabled {
+            return "Devre Dışı"
+        }
+        switch locationKeepAlive.authorizationStatus {
+        case .authorizedAlways:
+            return "Her Zaman Aktif ✓ (Mavi Bar Yok)"
+        case .authorizedWhenInUse:
+            return "Kullanırken (Mavi Bar Çıkabilir)"
+        case .notDetermined:
+            return "İzin Bekleniyor"
+        case .denied, .restricted:
+            return "İzin Kapalı"
+        @unknown default:
+            return "İzin Bekleniyor"
+        }
+    }
+
+    private var locationStatusColor: Color {
+        guard locationKeepAlive.isEnabled else { return .secondary }
+        switch locationKeepAlive.authorizationStatus {
+        case .authorizedAlways:
+            return .green
+        case .authorizedWhenInUse:
+            return .orange
+        case .denied, .restricted:
+            return .red
+        default:
+            return .secondary
         }
     }
 
@@ -110,6 +144,17 @@ struct SettingsView: View {
                 }
 
                 Section("iOS Entegrasyon & Arka Plan") {
+                    Toggle("Ölümsüz Arka Plan (3km Düşük Güç Konum)", isOn: $locationKeepAlive.isEnabled)
+                    LabeledContent("Konum Keep-Alive") {
+                        Text(locationStatusLabel)
+                            .foregroundStyle(locationStatusColor)
+                    }
+                    if locationKeepAlive.isEnabled && locationKeepAlive.authorizationStatus != .authorizedAlways {
+                        Button("Konum İznini 'Her Zaman' Yap (Mavi Barı Gizle)") {
+                            locationKeepAlive.requestAlwaysPermission()
+                        }
+                        .foregroundStyle(.orange)
+                    }
                     LabeledContent("Arka Planda Yenile", value: backgroundRefreshLabel)
                     if UIApplication.shared.backgroundRefreshStatus == .denied {
                         Button("Arka Planda Yenilemeyi Aç") {
@@ -171,6 +216,7 @@ struct SettingsView: View {
             .onAppear {
                 notifications.refreshAuthorizationStatus()
                 contacts.refreshAuthorizationStatus()
+                locationKeepAlive.refreshAuthorizationState()
             }
             .confirmationDialog(
                 "Android eşleştirmesi kaldırılsın mı?",

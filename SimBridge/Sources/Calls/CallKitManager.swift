@@ -73,17 +73,23 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         number: String,
         contactName: String?,
         simSlot: Int,
+        fromVoipPush: Bool = false,
         completion: ((Error?) -> Void)? = nil
     ) {
         let uuid: UUID
+        let wasExisting: Bool
+        let resolvedDisplayName: String?
         lock.lock()
         if let existing = uuidByCallId[callId] {
             uuid = existing
+            wasExisting = true
             if let contactName, !contactName.isEmpty, contactNameByUuid[existing] == nil {
                 contactNameByUuid[existing] = contactName
             }
+            resolvedDisplayName = contactNameByUuid[existing] ?? contactName
         } else {
             uuid = UUID()
+            wasExisting = false
             uuidByCallId[callId] = uuid
             callIdByUuid[uuid] = callId
             numberByUuid[uuid] = number
@@ -92,19 +98,26 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             }
             simSlotByUuid[uuid] = simSlot
             callCreatedAtByUuid[uuid] = Date()
+            resolvedDisplayName = contactName
         }
         lock.unlock()
 
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .phoneNumber, value: number)
-        update.localizedCallerName = (contactName?.isEmpty == false ? contactName : number)
+        update.localizedCallerName = (resolvedDisplayName?.isEmpty == false ? resolvedDisplayName : number)
         update.hasVideo = false
         update.supportsGrouping = false
         update.supportsHolding = true
         update.supportsDTMF = true
 
+        if wasExisting && !fromVoipPush {
+            provider.reportCall(with: uuid, updated: update)
+            completion?(nil)
+            return
+        }
+
         provider.reportNewIncomingCall(with: uuid, update: update) { err in
-            if err != nil {
+            if err != nil && !wasExisting {
                 self.removeMapping(uuid: uuid)
             }
             completion?(err)

@@ -270,6 +270,7 @@ final class BridgeClient: ObservableObject {
     private var cachedVoipToken: String?
     private var cachedAlertToken: String?
     private var isConnecting = false
+    private(set) var isAppInForeground: Bool = true
     private var lastConnectStartedAt: Date = .distantPast
     private var lastForegroundProbeAt: Date = .distantPast
     private var lastLanSignature: String = LanDiscovery.currentLanSignature()
@@ -287,9 +288,10 @@ final class BridgeClient: ObservableObject {
     private init() {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = false
-        // Keepalive runs every 10s, so use a generous idle timeout to avoid spurious WS drops.
-        cfg.timeoutIntervalForRequest = 45
+        // Background keepalive runs every 45s (12s foreground), so use 120s request timeout.
+        cfg.timeoutIntervalForRequest = 120
         urlSession = URLSession(configuration: cfg)
+        isAppInForeground = (UIApplication.shared.applicationState != .background)
 
         startNetworkMonitor()
 
@@ -678,6 +680,22 @@ final class BridgeClient: ObservableObject {
         connectNow(candidateIps: cleanIps, wsPort: wsPort, udpPort: udpPort, force: true, sweepSubnet: true)
     }
 
+    func setAppForegroundState(_ foreground: Bool) {
+        guard isAppInForeground != foreground else { return }
+        isAppInForeground = foreground
+        if isConnected {
+            sendCommand(BridgeWsMessage(type: "client_state", clientForeground: foreground))
+            startKeepaliveLoop()
+        }
+    }
+
+    func onBackgroundLocationTick() {
+        guard isPaired else { return }
+        if !isConnected && !isConnecting && Date().timeIntervalSince(lastConnectStartedAt) > 15.0 {
+            connectNow()
+        }
+    }
+
     func handleAppBecameActive() {
         guard isPaired else { return }
         let now = Date()
@@ -858,7 +876,8 @@ final class BridgeClient: ObservableObject {
                 type: "hello",
                 voipToken: cachedVoipToken,
                 alertToken: cachedAlertToken,
-                clientName: UIDevice.current.name
+                clientName: UIDevice.current.name,
+                clientForeground: isAppInForeground
             )
         )
     }
@@ -1015,7 +1034,8 @@ final class BridgeClient: ObservableObject {
             type: "hello",
             voipToken: cachedVoipToken,
             alertToken: cachedAlertToken,
-            clientName: UIDevice.current.name
+            clientName: UIDevice.current.name,
+            clientForeground: isAppInForeground
         )
         guard let plainData = try? JSONEncoder().encode(hello),
               let plain = String(data: plainData, encoding: .utf8),
@@ -1188,6 +1208,9 @@ final class BridgeClient: ObservableObject {
             }
         case "call_state":
             if let c = wsMsg.call {
+                if c.state == "ringing" && c.direction == "incoming" {
+                    sendCommand(BridgeWsMessage(type: "call_ring_ack", callId: c.callId))
+                }
                 CallKitManager.shared.handleRemoteCallState(c)
                 if c.state == "disconnected" {
                     activeCalls.removeAll { $0.callId == c.callId }
@@ -1259,7 +1282,10 @@ final class BridgeClient: ObservableObject {
         keepaliveTimer?.cancel()
         keepaliveTimer = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                let intervalNs: UInt64 = (self?.isAppInForeground ?? true)
+                    ? 12_000_000_000
+                    : 45_000_000_000
+                try? await Task.sleep(nanoseconds: intervalNs)
                 guard let self, self.isConnected, let task = self.wsTask else { return }
 
                 let sentAt = Date()

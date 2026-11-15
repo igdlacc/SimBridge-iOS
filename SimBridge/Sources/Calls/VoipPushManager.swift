@@ -75,7 +75,8 @@ final class VoipPushManager: NSObject, PKPushRegistryDelegate {
             callId: callId,
             number: number,
             contactName: resolvedName,
-            simSlot: simSlot
+            simSlot: simSlot,
+            fromVoipPush: true
         ) { _ in
             completion()
         }

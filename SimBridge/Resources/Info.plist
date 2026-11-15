@@ -50,6 +50,12 @@
 	<string>Android cihazdaki QR eşleştirme kodunu taramak için kamera erişimi gereklidir.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>Arayan ve SMS gönderen kişilerin adlarını göstermek için rehber erişimi gereklidir.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>SimBridge, iPhone ekranı kilitliyken Redmi köprü bağlantısının kesilmemesi ve aramaların/SMS'lerin anında düşmesi için GPS çipini açmadan düşük güçlü (3 km hücresel/Wi-Fi) arka plan konum servisini kullanır.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>SimBridge'in arka planda uyutulmaması ve üst ekranda mavi konum çubuğu çıkmadan yerel ağ (LAN) köprüsünü 7/24 açık tutabilmesi için lütfen "Her Zaman" (Always) seçeneğini seçin.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>SimBridge'in arka planda uyutulmaması ve üst ekranda mavi konum çubuğu çıkmadan yerel ağ (LAN) köprüsünü 7/24 açık tutabilmesi için "Her Zaman" izni gereklidir.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Hotspot ve yerel Wi-Fi üzerinden Android cihazla arama sesi ve SMS aktarımı yapmak için yerel ağ erişimi gereklidir.</string>
 	<key>NSMicrophoneUsageDescription</key>
@@ -68,6 +74,7 @@
 	<array>
 		<string>voip</string>
 		<string>audio</string>
+		<string>location</string>
 		<string>fetch</string>
 		<string>remote-notification</string>
 		<string>processing</string>
