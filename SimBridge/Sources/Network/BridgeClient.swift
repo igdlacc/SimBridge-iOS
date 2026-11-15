@@ -31,13 +31,7 @@ final class UdpAudioTransport: @unchecked Sendable {
             if sameTarget {
                 self.activeCallHash = hash
                 self.lock.unlock()
-                self.sendPacket(
-                    type: UdpAudioPacket.typeKeepalive,
-                    seq: 0,
-                    timestampSamples: 0,
-                    callHash: hash,
-                    payload: Data()
-                )
+                self.sendKeepalivePacket()
                 return
             }
 
@@ -61,15 +55,35 @@ final class UdpAudioTransport: @unchecked Sendable {
                 switch state {
                 case .ready:
                     self.lock.lock()
-                    let curHash = self.activeCallHash
+                    let isCurrent = (self.connection === conn && !self.isConnectionFailed)
                     self.lock.unlock()
-                    self.sendPacket(
-                        type: UdpAudioPacket.typeKeepalive,
-                        seq: 0,
-                        timestampSamples: 0,
-                        callHash: curHash,
-                        payload: Data()
-                    )
+                    guard isCurrent else { return }
+
+                    self.sendKeepalivePacket()
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(120)) { [weak self] in
+                        self?.sendKeepalivePacket()
+                    }
+                    self.queue.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
+                        self?.sendKeepalivePacket()
+                    }
+
+                    let timer = DispatchSource.makeTimerSource(queue: self.queue)
+                    timer.schedule(deadline: .now() + .milliseconds(1000), repeating: .milliseconds(1000))
+                    timer.setEventHandler { [weak self] in
+                        self?.sendKeepalivePacket()
+                    }
+                    self.lock.lock()
+                    let stillCurrent = (self.connection === conn && !self.isConnectionFailed)
+                    if stillCurrent {
+                        self.keepaliveTimer?.cancel()
+                        self.keepaliveTimer = timer
+                    }
+                    self.lock.unlock()
+                    if stillCurrent {
+                        timer.resume()
+                    } else {
+                        timer.cancel()
+                    }
                 case .failed, .cancelled:
                     self.lock.lock()
                     if self.connection === conn {
@@ -82,27 +96,22 @@ final class UdpAudioTransport: @unchecked Sendable {
             }
             conn.start(queue: self.queue)
             self.receiveLoop(conn: conn, key: key, consecutiveErrors: 0)
-
-            let timer = DispatchSource.makeTimerSource(queue: self.queue)
-            timer.schedule(deadline: .now() + .milliseconds(1500), repeating: .milliseconds(1500))
-            timer.setEventHandler { [weak self] in
-                guard let self else { return }
-                self.lock.lock()
-                let hasConn = (self.connection != nil && !self.isConnectionFailed)
-                let curHash = self.activeCallHash
-                self.lock.unlock()
-                guard hasConn else { return }
-                self.sendPacket(
-                    type: UdpAudioPacket.typeKeepalive,
-                    seq: 0,
-                    timestampSamples: 0,
-                    callHash: curHash,
-                    payload: Data()
-                )
-            }
-            self.keepaliveTimer = timer
-            timer.resume()
         }
+    }
+
+    private func sendKeepalivePacket() {
+        lock.lock()
+        let hasConn = (connection != nil && !isConnectionFailed)
+        let curHash = activeCallHash
+        lock.unlock()
+        guard hasConn else { return }
+        sendPacket(
+            type: UdpAudioPacket.typeKeepalive,
+            seq: 0,
+            timestampSamples: 0,
+            callHash: curHash,
+            payload: Data()
+        )
     }
 
     func stop() {
@@ -271,6 +280,7 @@ final class BridgeClient: ObservableObject {
     private var cachedAlertToken: String?
     private var isConnecting = false
     private(set) var isAppInForeground: Bool = true
+    private var lastPongAt: Date = Date()
     private var lastConnectStartedAt: Date = .distantPast
     private var lastForegroundProbeAt: Date = .distantPast
     private var lastLanSignature: String = LanDiscovery.currentLanSignature()
@@ -693,6 +703,23 @@ final class BridgeClient: ObservableObject {
         guard isPaired else { return }
         if !isConnected && !isConnecting && Date().timeIntervalSince(lastConnectStartedAt) > 15.0 {
             connectNow()
+            return
+        }
+        if isConnected,
+           let currentTask = wsTask,
+           Date().timeIntervalSince(lastPongAt) > 65.0 {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let alive = await self.probeNativeWsPing(task: currentTask, timeoutNs: 5_000_000_000)
+                if alive {
+                    self.lastPongAt = Date()
+                } else {
+                    self.resetDeadSocketAndReconnect(
+                        task: currentTask,
+                        banner: "Bağlantı koptu, yeniden deneniyor..."
+                    )
+                }
+            }
         }
     }
 
@@ -761,7 +788,7 @@ final class BridgeClient: ObservableObject {
 
     func startUdpSession(callId: String) {
         guard let stored = PairingStore.shared.load(),
-              let host = connectedHost ?? stored.candidateIps.first ?? stored.lastWorkingIp,
+              let host = connectedHost ?? stored.lastWorkingIp ?? stored.candidateIps.first,
               !host.isEmpty,
               let key = BridgeCrypto.decodeBase64Url(stored.keyB64) else {
             return
@@ -1118,6 +1145,7 @@ final class BridgeClient: ObservableObject {
             self.retryAttemptCount = 0
             self.wsTask = win.task
             self.isConnected = true
+            self.lastPongAt = Date()
             self.connectedHost = win.ip
             self.statusBanner = "Bağlı (\(win.ip))"
             PairingStore.shared.updateIps([win.ip], lastWorkingIp: win.ip, wsPort: win.wsPort, udpPort: win.udpPort)
@@ -1156,6 +1184,7 @@ final class BridgeClient: ObservableObject {
             while !Task.isCancelled && self.wsTask === task {
                 do {
                     let raw = try await task.receive()
+                    self.lastPongAt = Date()
                     await self.handleWebSocketMessage(raw, key: key)
                 } catch {
                     guard self.wsTask === task else { return }
@@ -1278,6 +1307,16 @@ final class BridgeClient: ObservableObject {
         }
     }
 
+    private func resetDeadSocketAndReconnect(task: URLSessionWebSocketTask, banner: String) {
+        guard wsTask === task else { return }
+        task.cancel(with: .goingAway, reason: nil)
+        wsTask = nil
+        isConnected = false
+        pingLatencyMs = nil
+        statusBanner = banner
+        connectNow(force: true)
+    }
+
     private func startKeepaliveLoop() {
         keepaliveTimer?.cancel()
         keepaliveTimer = Task { [weak self] in
@@ -1288,20 +1327,18 @@ final class BridgeClient: ObservableObject {
                 try? await Task.sleep(nanoseconds: intervalNs)
                 guard let self, self.isConnected, let task = self.wsTask else { return }
 
+                let pingTimeoutNs: UInt64 = self.isAppInForeground ? 3_500_000_000 : 6_000_000_000
                 let sentAt = Date()
-                let alive = await self.probeNativeWsPing(task: task, timeoutNs: 3_500_000_000)
+                let alive = await self.probeNativeWsPing(task: task, timeoutNs: pingTimeoutNs)
                 guard !Task.isCancelled else { return }
                 if alive {
+                    self.lastPongAt = Date()
                     self.pingLatencyMs = max(1, Int(Date().timeIntervalSince(sentAt) * 1000))
                 } else {
-                    if self.wsTask === task {
-                        task.cancel(with: .goingAway, reason: nil)
-                        self.wsTask = nil
-                        self.isConnected = false
-                        self.pingLatencyMs = nil
-                        self.statusBanner = "Bağlantı zaman aşımı, yeniden bağlanılıyor..."
-                        self.connectNow(force: true)
-                    }
+                    self.resetDeadSocketAndReconnect(
+                        task: task,
+                        banner: "Bağlantı zaman aşımı, yeniden bağlanılıyor..."
+                    )
                     return
                 }
             }
