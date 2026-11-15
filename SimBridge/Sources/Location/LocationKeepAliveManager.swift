@@ -20,6 +20,8 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
     @Published private(set) var isRunning: Bool = false
 
     private let manager = CLLocationManager()
+    private var backgroundTickTimer: DispatchSourceTimer?
+    private var lastLocationRestartAt: Date = Date()
 
     private override init() {
         if UserDefaults.standard.object(forKey: Self.enabledKey) == nil {
@@ -34,7 +36,7 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
         // Strictly kCLDistanceFilterNone so iOS 16.4+ locationd never treats the background session as idle.
         manager.distanceFilter = kCLDistanceFilterNone
         manager.pausesLocationUpdatesAutomatically = false
-        manager.activityType = .otherNavigation
+        manager.activityType = .other
         authorizationStatus = manager.authorizationStatus
     }
 
@@ -48,12 +50,19 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
         applyState()
     }
 
+    func promptIfNotDetermined() {
+        authorizationStatus = manager.authorizationStatus
+        if isEnabled && authorizationStatus == .notDetermined {
+            manager.requestWhenInUseAuthorization()
+        }
+    }
+
     func requestAlwaysPermission() {
         let status = manager.authorizationStatus
         authorizationStatus = status
         switch status {
         case .notDetermined:
-            manager.requestAlwaysAuthorization()
+            manager.requestWhenInUseAuthorization()
         case .authorizedWhenInUse:
             if !UserDefaults.standard.bool(forKey: Self.requestedAlwaysOnceKey) {
                 UserDefaults.standard.set(true, forKey: Self.requestedAlwaysOnceKey)
@@ -68,7 +77,7 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
         case .authorizedAlways:
             applyState()
         @unknown default:
-            manager.requestAlwaysAuthorization()
+            manager.requestWhenInUseAuthorization()
         }
     }
 
@@ -81,18 +90,21 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
             manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
             manager.distanceFilter = kCLDistanceFilterNone
             manager.pausesLocationUpdatesAutomatically = false
-            manager.activityType = .otherNavigation
+            manager.activityType = .other
             if hasLocationMode {
                 manager.allowsBackgroundLocationUpdates = true
             }
             // With "Her Zaman" (Always), hides blue status pill / Dynamic Island indicator completely.
             manager.showsBackgroundLocationIndicator = false
+            lastLocationRestartAt = Date()
             manager.startUpdatingLocation()
             if CLLocationManager.significantLocationChangeMonitoringAvailable() {
                 manager.startMonitoringSignificantLocationChanges()
             }
+            startBackgroundTickTimer()
             isRunning = true
         } else {
+            stopBackgroundTickTimer()
             manager.stopUpdatingLocation()
             if CLLocationManager.significantLocationChangeMonitoringAvailable() {
                 manager.stopMonitoringSignificantLocationChanges()
@@ -101,12 +113,43 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
         }
     }
 
+    private func startBackgroundTickTimer() {
+        guard backgroundTickTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        timer.schedule(deadline: .now() + .seconds(30), repeating: .seconds(30), leeway: .seconds(5))
+        timer.setEventHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, self.isRunning else { return }
+                if UIApplication.shared.applicationState != .active {
+                    BridgeClient.shared.onBackgroundLocationTick()
+                }
+                if Date().timeIntervalSince(self.lastLocationRestartAt) > 600 {
+                    self.lastLocationRestartAt = Date()
+                    self.manager.startUpdatingLocation()
+                }
+            }
+        }
+        backgroundTickTimer = timer
+        timer.resume()
+    }
+
+    private func stopBackgroundTickTimer() {
+        backgroundTickTimer?.cancel()
+        backgroundTickTimer = nil
+    }
+
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = manager.authorizationStatus
         Task { @MainActor [weak self] in
             guard let self else { return }
             self.authorizationStatus = status
             self.applyState()
+            if status == .authorizedWhenInUse,
+               self.isEnabled,
+               !UserDefaults.standard.bool(forKey: Self.requestedAlwaysOnceKey) {
+                UserDefaults.standard.set(true, forKey: Self.requestedAlwaysOnceKey)
+                self.manager.requestAlwaysAuthorization()
+            }
         }
     }
 

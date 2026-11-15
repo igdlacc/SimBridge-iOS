@@ -573,7 +573,9 @@ final class BridgeClient: ObservableObject {
 
         let targetWsPort = (wsPort ?? 0) > 0 ? (wsPort ?? stored.wsPort) : stored.wsPort
         let targetUdpPort = (udpPort ?? 0) > 0 ? (udpPort ?? stored.udpPort) : stored.udpPort
-        let shouldSweep = sweepSubnet || retryAttemptCount >= 1
+        let shouldSweep = isAppInForeground
+            ? (sweepSubnet || retryAttemptCount >= 1)
+            : (sweepSubnet || retryAttemptCount == 1 || (retryAttemptCount >= 6 && retryAttemptCount % 6 == 0))
         lastAttemptedIps = Set(ips)
 
         reconnectTask?.cancel()
@@ -1168,7 +1170,18 @@ final class BridgeClient: ObservableObject {
 
     private func scheduleAutoRetry() {
         retryTask?.cancel()
-        let delayNs: UInt64 = retryAttemptCount <= 3 ? 1_200_000_000 : 2_500_000_000
+        let delayNs: UInt64
+        if isAppInForeground {
+            delayNs = retryAttemptCount <= 3 ? 1_200_000_000 : 2_500_000_000
+        } else if retryAttemptCount <= 2 {
+            delayNs = 1_500_000_000
+        } else if retryAttemptCount <= 4 {
+            delayNs = 5_000_000_000
+        } else if retryAttemptCount <= 7 {
+            delayNs = 15_000_000_000
+        } else {
+            delayNs = 30_000_000_000
+        }
         retryTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: delayNs)
             guard !Task.isCancelled, let self, self.isPaired, !self.isConnected, !self.isConnecting else {

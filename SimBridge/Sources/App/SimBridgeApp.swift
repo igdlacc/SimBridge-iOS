@@ -222,6 +222,7 @@ struct SimBridgeApp: App {
                         ContactsHelper.shared.refreshAuthorizationStatus()
                         NotificationManager.shared.refreshAuthorizationStatus()
                         LocationKeepAliveManager.shared.refreshAuthorizationState()
+                        LocationKeepAliveManager.shared.promptIfNotDetermined()
                     } else if newPhase == .background {
                         BridgeClient.shared.setAppForegroundState(false)
                         LocationKeepAliveManager.shared.startIfAuthorized()
