@@ -1,9 +1,25 @@
+import BackgroundTasks
 import Intents
 import SwiftUI
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
     private var lastActivityKey: String?
     private var lastActivityAt: Date = .distantPast
+
+    static var permittedRefreshIdentifiers: [String] {
+        (Bundle.main.object(forInfoDictionaryKey: "BGTaskSchedulerPermittedIdentifiers") as? [String])
+            ?? ["com.simbridge.ios.refresh"]
+    }
+
+    static var activeRefreshTaskIdentifier: String {
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.simbridge.ios"
+        let candidate = "\(bundleId).refresh"
+        let permitted = permittedRefreshIdentifiers
+        if permitted.contains(candidate) {
+            return candidate
+        }
+        return permitted.first ?? "com.simbridge.ios.refresh"
+    }
 
     func application(
         _ application: UIApplication,
@@ -14,11 +30,71 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         VoipPushManager.shared.start()
         NotificationManager.shared.configure()
 
+        application.setMinimumBackgroundFetchInterval(UIApplication.backgroundFetchIntervalMinimum)
+        for identifier in Set(Self.permittedRefreshIdentifiers) {
+            BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { task in
+                Self.handleAppRefresh(task: task)
+            }
+        }
+        Self.scheduleAppRefresh()
+
         if let dict = launchOptions?[.userActivityDictionary] as? [AnyHashable: Any],
            let activity = dict["UIApplicationLaunchOptionsUserActivityKey"] as? NSUserActivity {
             _ = handleStartCallUserActivity(activity)
         }
         return true
+    }
+
+    static func scheduleAppRefresh() {
+        let request = BGAppRefreshTaskRequest(identifier: activeRefreshTaskIdentifier)
+        request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
+        try? BGTaskScheduler.shared.submit(request)
+    }
+
+    private static func handleAppRefresh(task: BGTask) {
+        scheduleAppRefresh()
+        let lock = NSLock()
+        var finished = false
+        let completeTask: @Sendable (Bool) -> Void = { success in
+            lock.lock()
+            let already = finished
+            finished = true
+            lock.unlock()
+            if !already {
+                task.setTaskCompleted(success: success)
+            }
+        }
+        task.expirationHandler = {
+            completeTask(false)
+        }
+        Task { @MainActor in
+            BridgeClient.shared.performBackgroundRefresh { success in
+                completeTask(success)
+            }
+        }
+    }
+
+    func application(
+        _ application: UIApplication,
+        performFetchWithCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        Task { @MainActor in
+            BridgeClient.shared.performBackgroundRefresh { ok in
+                completionHandler(ok ? .newData : .noData)
+            }
+        }
+    }
+
+    func application(
+        _ application: UIApplication,
+        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        Task { @MainActor in
+            BridgeClient.shared.performBackgroundRefresh { ok in
+                completionHandler(ok ? .newData : .noData)
+            }
+        }
     }
 
     func application(
@@ -77,18 +153,31 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     }
 
     func handleIncomingUrl(_ url: URL) {
-        guard url.scheme?.lowercased() == "simbridge" else { return }
+        let scheme = url.scheme?.lowercased() ?? ""
         var rawTarget: String?
-        if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-           let qVal = comps.queryItems?.first(where: { $0.name == "number" || $0.name == "tel" || $0.name == "target" })?.value,
-           !qVal.isEmpty {
-            rawTarget = qVal
-        } else {
-            let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            if !path.isEmpty {
-                rawTarget = path
-            } else if let host = url.host, host.lowercased() != "call", !host.isEmpty {
-                rawTarget = host
+        if scheme == "tel" || scheme == "telprompt" {
+            let raw = url.absoluteString.replacingOccurrences(
+                of: "^(?i)tel(prompt)?:(//)?",
+                with: "",
+                options: .regularExpression
+            )
+            let decoded = raw.removingPercentEncoding ?? raw
+            let cleaned = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleaned.isEmpty {
+                rawTarget = cleaned
+            }
+        } else if scheme == "simbridge" {
+            if let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+               let qVal = comps.queryItems?.first(where: { $0.name == "number" || $0.name == "tel" || $0.name == "target" })?.value,
+               !qVal.isEmpty {
+                rawTarget = qVal
+            } else {
+                let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                if !path.isEmpty {
+                    rawTarget = path
+                } else if let host = url.host, host.lowercased() != "call", !host.isEmpty {
+                    rawTarget = host
+                }
             }
         }
         guard let rawTarget, !rawTarget.isEmpty else { return }
@@ -130,6 +219,8 @@ struct SimBridgeApp: App {
                         BridgeClient.shared.handleAppBecameActive()
                         ContactsHelper.shared.refreshAuthorizationStatus()
                         NotificationManager.shared.refreshAuthorizationStatus()
+                    } else if newPhase == .background {
+                        AppDelegate.scheduleAppRefresh()
                     }
                 }
         }

@@ -26,6 +26,7 @@ targets:
     deploymentTarget: "16.0"
     sources:
       - path: SimBridge/Sources
+      - path: SimBridge/Resources/Assets.xcassets
     settings:
       base:
         INFOPLIST_FILE: SimBridge/Resources/Info.plist
@@ -41,6 +42,6 @@ targets:
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-lopus"
-        MARKETING_VERSION: "1.1.2"
-        CURRENT_PROJECT_VERSION: "4"
-        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        MARKETING_VERSION: "1.1.3"
+        CURRENT_PROJECT_VERSION: "5"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

@@ -18,9 +18,22 @@ final class ContactsHelper: ObservableObject {
     private let store = CNContactStore()
     private var suffixIndex: [String: String] = [:]
     private var hasLoadedOnce = false
+    private var storeObserver: NSObjectProtocol?
 
     private init() {
         refreshAuthorizationStatus()
+        storeObserver = NotificationCenter.default.addObserver(
+            forName: .CNContactStoreDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if CNContactStore.authorizationStatus(for: .contacts) == .authorized {
+                    self.refreshAuthorizationStatus(forceReload: true)
+                }
+            }
+        }
     }
 
     func refreshAuthorizationStatus(forceReload: Bool = false) {

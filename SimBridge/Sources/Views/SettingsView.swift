@@ -18,6 +18,19 @@ struct SettingsView: View {
         return "\(ver) (\(build))"
     }
 
+    private var backgroundRefreshLabel: String {
+        switch UIApplication.shared.backgroundRefreshStatus {
+        case .available:
+            return "Açık ✓"
+        case .denied:
+            return "Kapalı (Ayarlardan Açın)"
+        case .restricted:
+            return "Kısıtlı"
+        @unknown default:
+            return "Bilinmiyor"
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -94,6 +107,18 @@ struct SettingsView: View {
                             contacts.requestAccessAndLoad()
                         }
                     }
+                }
+
+                Section("iOS Entegrasyon & Arka Plan") {
+                    LabeledContent("Arka Planda Yenile", value: backgroundRefreshLabel)
+                    if UIApplication.shared.backgroundRefreshStatus == .denied {
+                        Button("Arka Planda Yenilemeyi Aç") {
+                            openSystemSettings()
+                        }
+                        .foregroundStyle(.orange)
+                    }
+                    LabeledContent("CallKit & Kişiler", value: "Aktif (Ara'ya basılı tut → SimBridge)")
+                    LabeledContent("Siri & tel:// Bağlantıları", value: "Destekleniyor ✓")
                 }
 
                 Section("Ses & Hoparlör") {

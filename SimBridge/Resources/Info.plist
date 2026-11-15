@@ -14,6 +14,8 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>simbridge</string>
+				<string>tel</string>
+				<string>telprompt</string>
 			</array>
 		</dict>
 	</array>
@@ -57,10 +59,18 @@
 		<string>INStartCallIntent</string>
 		<string>INStartAudioCallIntent</string>
 	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.simbridge.ios.refresh</string>
+		<string>com.sait.dist.refresh</string>
+	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>voip</string>
 		<string>audio</string>
+		<string>fetch</string>
+		<string>remote-notification</string>
+		<string>processing</string>
 	</array>
 	<key>UIApplicationSceneManifest</key>
 	<dict>

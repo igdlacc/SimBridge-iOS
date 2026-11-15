@@ -1,6 +1,7 @@
 import AVFoundation
 import CallKit
 import Foundation
+import UIKit
 
 final class CallKitManager: NSObject, CXProviderDelegate {
     static let shared = CallKitManager()
@@ -22,6 +23,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var activeAudioCallId: String?
     private var userHeldCallUuids: Set<UUID> = []
     private var internalHoldBounceUuids: Set<UUID> = []
+    private var remoteHoldSyncUuids: Set<UUID> = []
     private var lastHoldBounceAt: Date = .distantPast
 
     var currentActiveAudioCallId: String? {
@@ -52,12 +54,15 @@ final class CallKitManager: NSObject, CXProviderDelegate {
 
     private override init() {
         let cfg = CXProviderConfiguration()
-        cfg.supportedHandleTypes = [.phoneNumber]
+        cfg.supportedHandleTypes = [.phoneNumber, .generic]
         cfg.supportsVideo = false
         cfg.maximumCallsPerCallGroup = 2
         cfg.maximumCallGroups = 1
         cfg.includesCallsInRecents = true
         cfg.ringtoneSound = nil
+        if let logo = UIImage(named: "CallKitLogo")?.pngData() {
+            cfg.iconTemplateImageData = logo
+        }
         provider = CXProvider(configuration: cfg)
         super.init()
         provider.setDelegate(self, queue: nil)
@@ -302,16 +307,51 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 }
             }
         case "active":
-            if let uuid, dto.direction == "outgoing" {
-                var shouldReport = false
+            if let uuid {
+                var shouldReportConnected = false
                 lock.lock()
-                if outgoingUuids.contains(uuid), !reportedConnectedUuids.contains(uuid) {
+                if dto.direction == "outgoing", outgoingUuids.contains(uuid), !reportedConnectedUuids.contains(uuid) {
                     reportedConnectedUuids.insert(uuid)
-                    shouldReport = true
+                    shouldReportConnected = true
                 }
+                let isBouncing = internalHoldBounceUuids.contains(uuid)
                 lock.unlock()
-                if shouldReport {
+                if shouldReportConnected {
                     provider.reportOutgoingCall(with: uuid, connectedAt: Date())
+                }
+                if !isBouncing,
+                   !dto.onHold,
+                   let sysCall = callController.callObserver.calls.first(where: { $0.uuid == uuid && !$0.hasEnded }),
+                   sysCall.isOnHold {
+                    lock.lock()
+                    remoteHoldSyncUuids.insert(uuid)
+                    lock.unlock()
+                    callController.request(CXTransaction(action: CXSetHeldCallAction(call: uuid, onHold: false))) { _ in }
+                }
+            }
+            if AudioEngineManager.shared.isMuted != dto.muted {
+                AudioEngineManager.shared.setMuted(dto.muted)
+            }
+        case "holding":
+            if let uuid {
+                var shouldReportConnected = false
+                lock.lock()
+                if dto.direction == "outgoing", outgoingUuids.contains(uuid), !reportedConnectedUuids.contains(uuid) {
+                    reportedConnectedUuids.insert(uuid)
+                    shouldReportConnected = true
+                }
+                let isBouncing = internalHoldBounceUuids.contains(uuid)
+                lock.unlock()
+                if shouldReportConnected {
+                    provider.reportOutgoingCall(with: uuid, connectedAt: Date())
+                }
+                if !isBouncing,
+                   let sysCall = callController.callObserver.calls.first(where: { $0.uuid == uuid && !$0.hasEnded }),
+                   !sysCall.isOnHold {
+                    lock.lock()
+                    remoteHoldSyncUuids.insert(uuid)
+                    lock.unlock()
+                    callController.request(CXTransaction(action: CXSetHeldCallAction(call: uuid, onHold: true))) { _ in }
                 }
             }
             if AudioEngineManager.shared.isMuted != dto.muted {
@@ -342,13 +382,19 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         let remoteIds = Set(remoteCalls.map(\.callId))
         let now = Date()
         var staleUuids: [UUID] = []
+        var earliestGraceRemaining: TimeInterval?
 
         lock.lock()
         for (uuid, cid) in callIdByUuid {
             if !remoteIds.contains(cid) {
+                let isUnconfirmedOutgoing = outgoingUuids.contains(uuid) && !reportedConnectingUuids.contains(uuid)
+                let isTestPush = cid.hasPrefix("test-")
                 let age = callCreatedAtByUuid[uuid].map { now.timeIntervalSince($0) } ?? 999
-                if age > 8.0 {
+                if (!isUnconfirmedOutgoing && !isTestPush) || age > 8.5 {
                     staleUuids.append(uuid)
+                } else {
+                    let rem = max(0.3, 8.6 - age)
+                    earliestGraceRemaining = min(earliestGraceRemaining ?? rem, rem)
                 }
             }
         }
@@ -365,6 +411,12 @@ final class CallKitManager: NSObject, CXProviderDelegate {
             if emptyAfterRemove {
                 AudioEngineManager.shared.stop()
                 BridgeClient.shared.stopUdpSession()
+            }
+        }
+        if let delaySec = earliestGraceRemaining {
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
+                CallKitManager.shared.reconcileActiveCalls(BridgeClient.shared.activeCalls)
             }
         }
     }
@@ -615,6 +667,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.lock()
         let callId = callIdByUuid[action.callUUID]
         let isInternalBounce = internalHoldBounceUuids.contains(action.callUUID)
+        let isRemoteSync = remoteHoldSyncUuids.remove(action.callUUID) != nil
         if !isInternalBounce {
             if action.isOnHold {
                 userHeldCallUuids.insert(action.callUUID)
@@ -625,13 +678,13 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         lock.unlock()
 
         AudioEngineManager.shared.recordDiagnostic(
-            "CallKit setHeld held=\(action.isOnHold) internal=\(isInternalBounce)"
+            "CallKit setHeld held=\(action.isOnHold) internal=\(isInternalBounce) remote=\(isRemoteSync)"
         )
 
         if !action.isOnHold {
             configureAudioSession(source: isInternalBounce ? "bounce_unhold" : "unhold_action")
         }
-        if !isInternalBounce {
+        if !isInternalBounce && !isRemoteSync {
             Task { @MainActor in
                 BridgeClient.shared.updateLocalCallHoldState(callId: callId, held: action.isOnHold)
                 _ = await BridgeClient.shared.sendReliableCommand(
@@ -785,6 +838,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         reportedConnectedUuids.remove(uuid)
         userHeldCallUuids.remove(uuid)
         internalHoldBounceUuids.remove(uuid)
+        remoteHoldSyncUuids.remove(uuid)
         if pendingOutgoingUuid == uuid { pendingOutgoingUuid = nil }
         lock.unlock()
     }
@@ -801,6 +855,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         reportedConnectedUuids.removeAll()
         userHeldCallUuids.removeAll()
         internalHoldBounceUuids.removeAll()
+        remoteHoldSyncUuids.removeAll()
         pendingOutgoingUuid = nil
         activeAudioCallId = nil
     }

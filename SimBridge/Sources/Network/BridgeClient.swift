@@ -497,6 +497,41 @@ final class BridgeClient: ObservableObject {
         }
     }
 
+    func performBackgroundRefresh(completion: @escaping @Sendable (Bool) -> Void) {
+        guard isPaired else {
+            completion(false)
+            return
+        }
+        let once = OnceFlag()
+        let finish: @Sendable (Bool) -> Void = { success in
+            guard once.claim() else { return }
+            completion(success)
+        }
+        Task { @MainActor [weak self] in
+            guard let self else {
+                finish(false)
+                return
+            }
+            if !self.isConnected {
+                self.startDiscovery()
+                self.connectNow(force: true, sweepSubnet: false)
+                for _ in 0..<45 {
+                    if self.isConnected { break }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            } else {
+                await self.refreshSync()
+            }
+            if self.isConnected {
+                VoipPushManager.shared.resendTokensIfAvailable()
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                finish(true)
+            } else {
+                finish(false)
+            }
+        }
+    }
+
     func connectNow(
         candidateIps: [String]? = nil,
         wsPort: Int? = nil,

@@ -19,6 +19,17 @@ final class VoipPushManager: NSObject, PKPushRegistryDelegate {
         registry = reg
     }
 
+    @MainActor
+    func resendTokensIfAvailable() {
+        let voip = currentVoipTokenHex
+        let alert = NotificationManager.shared.currentAlertTokenHex
+        guard !voip.isEmpty || !alert.isEmpty else { return }
+        BridgeClient.shared.updatePushTokens(
+            voipToken: voip.isEmpty ? nil : voip,
+            alertToken: alert.isEmpty ? nil : alert
+        )
+    }
+
     func pushRegistry(
         _ registry: PKPushRegistry,
         didUpdate pushCredentials: PKPushCredentials,
