@@ -1,3 +1,4 @@
+import AudioToolbox
 import SwiftUI
 import UIKit
 
@@ -25,12 +26,6 @@ struct DialerView: View {
     private var exactContactName: String? {
         guard !numberText.isEmpty else { return nil }
         return contacts.resolveName(for: numberText)
-    }
-
-    private var clipboardDialableNumber: String? {
-        guard numberText.isEmpty, let clip = UIPasteboard.general.string else { return nil }
-        let filtered = BridgeFormatters.filterDialable(clip)
-        return filtered.count >= 3 ? filtered : nil
     }
 
     var body: some View {
@@ -62,14 +57,16 @@ struct DialerView: View {
                                     Label("Temizle", systemImage: "trash")
                                 }
                             }
-                            if let clip = UIPasteboard.general.string {
-                                let filtered = BridgeFormatters.filterDialable(clip)
-                                if !filtered.isEmpty {
-                                    Button {
-                                        numberText = filtered
-                                    } label: {
-                                        Label("Yapıştır (\(filtered))", systemImage: "doc.on.clipboard")
+                            if UIPasteboard.general.hasStrings {
+                                Button {
+                                    if let clip = UIPasteboard.general.string {
+                                        let filtered = BridgeFormatters.filterDialable(clip)
+                                        if !filtered.isEmpty {
+                                            numberText = filtered
+                                        }
                                     }
+                                } label: {
+                                    Label("Panodan Yapıştır", systemImage: "doc.on.clipboard")
                                 }
                             }
                         }
@@ -78,16 +75,6 @@ struct DialerView: View {
                         Text(name)
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(.green)
-                    } else if let clipNum = clipboardDialableNumber {
-                        Button {
-                            SimHaptics.tap(.light)
-                            numberText = clipNum
-                        } label: {
-                            Label("Panodan Yapıştır: \(clipNum)", systemImage: "doc.on.clipboard")
-                                .font(.caption.weight(.medium))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     } else if !matchingContacts.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
@@ -112,6 +99,17 @@ struct DialerView: View {
                             }
                             .padding(.horizontal)
                         }
+                    } else if numberText.isEmpty && UIPasteboard.general.hasStrings {
+                        PasteButton(payloadType: String.self) { strings in
+                            guard let raw = strings.first else { return }
+                            let filtered = BridgeFormatters.filterDialable(raw)
+                            guard !filtered.isEmpty else { return }
+                            SimHaptics.tap(.light)
+                            numberText = filtered
+                        }
+                        .labelStyle(.titleAndIcon)
+                        .controlSize(.small)
+                        .buttonBorderShape(.capsule)
                     } else {
                         Text(" ")
                             .font(.subheadline)
@@ -130,6 +128,8 @@ struct DialerView: View {
                                     numberText.append(digit)
                                     if let active = bridge.activeCalls.first(where: { $0.state == "active" }) {
                                         CallKitManager.shared.sendDtmf(callId: active.callId, digits: digit)
+                                    } else if bridge.activeCalls.isEmpty {
+                                        Self.playDialTone(for: digit)
                                     }
                                 } label: {
                                     VStack(spacing: 1) {
@@ -241,5 +241,26 @@ struct DialerView: View {
     private var callButtonColor: Color {
         if !bridge.isPaired || numberText.isEmpty { return .gray }
         return bridge.isConnected ? .green : .orange
+    }
+
+    private static func playDialTone(for digit: String) {
+        let soundId: SystemSoundID? = switch digit {
+        case "0": 1200
+        case "1": 1201
+        case "2": 1202
+        case "3": 1203
+        case "4": 1204
+        case "5": 1205
+        case "6": 1206
+        case "7": 1207
+        case "8": 1208
+        case "9": 1209
+        case "*": 1210
+        case "#": 1211
+        default: nil
+        }
+        if let soundId {
+            AudioServicesPlaySystemSound(soundId)
+        }
     }
 }

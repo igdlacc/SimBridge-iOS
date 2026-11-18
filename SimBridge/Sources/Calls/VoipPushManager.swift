@@ -2,11 +2,11 @@ import Contacts
 import Foundation
 import PushKit
 
-final class VoipPushManager: NSObject, PKPushRegistryDelegate {
+final class VoipPushManager: NSObject, ObservableObject, PKPushRegistryDelegate {
     static let shared = VoipPushManager()
 
     private var registry: PKPushRegistry?
-    private(set) var currentVoipTokenHex: String = ""
+    @Published private(set) var currentVoipTokenHex: String = ""
 
     private override init() {
         super.init()
@@ -37,7 +37,13 @@ final class VoipPushManager: NSObject, PKPushRegistryDelegate {
     ) {
         guard type == .voIP else { return }
         let hex = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
-        currentVoipTokenHex = hex
+        if Thread.isMainThread {
+            currentVoipTokenHex = hex
+        } else {
+            DispatchQueue.main.async {
+                self.currentVoipTokenHex = hex
+            }
+        }
         Task { @MainActor in
             BridgeClient.shared.updatePushTokens(voipToken: hex)
         }

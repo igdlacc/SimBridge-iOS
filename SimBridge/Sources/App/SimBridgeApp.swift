@@ -1,6 +1,7 @@
 import BackgroundTasks
 import Intents
 import SwiftUI
+import UserNotifications
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
     private var lastActivityKey: String?
@@ -126,6 +127,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             let contact = intent.contacts?.first
             rawNumber = contact?.personHandle?.value
             fallbackName = contact?.displayName
+        }
+
+        if rawNumber == nil && fallbackName == nil, let webUrl = userActivity.webpageURL {
+            let scheme = webUrl.scheme?.lowercased() ?? ""
+            if scheme == "tel" || scheme == "telprompt" || scheme == "simbridge" {
+                handleIncomingUrl(webUrl)
+                return true
+            }
         }
 
         let targetQuery = (rawNumber?.isEmpty == false ? rawNumber : fallbackName)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -286,6 +295,12 @@ struct MainTabView: View {
             if isEmpty && router.activeCallSheetPresented {
                 router.activeCallSheetPresented = false
             }
+        }
+        .onAppear {
+            UNUserNotificationCenter.current().setBadgeCount(unreadSmsCount, withCompletionHandler: nil)
+        }
+        .onChange(of: unreadSmsCount) { count in
+            UNUserNotificationCenter.current().setBadgeCount(count, withCompletionHandler: nil)
         }
     }
 }

@@ -64,6 +64,7 @@
 	<array>
 		<string>INStartCallIntent</string>
 		<string>INStartAudioCallIntent</string>
+		<string>INSendMessageIntent</string>
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>

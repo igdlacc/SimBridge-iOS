@@ -171,7 +171,8 @@ struct SmsView: View {
                 AvatarCircle(
                     title: thread.displayName,
                     size: 44,
-                    tint: thread.unreadCount > 0 ? .blue : .secondary
+                    tint: thread.unreadCount > 0 ? .blue : .secondary,
+                    imageData: contacts.thumbnailData(for: thread.address)
                 )
                 if thread.unreadCount > 0 {
                     Circle()
@@ -478,13 +479,15 @@ struct SmsConversationView: View {
                     .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !bridge.isPaired)
                 }
 
-                if draft.count >= 100 {
-                    let segments = max(1, (draft.count + 152) / 153)
-                    HStack {
-                        Spacer()
-                        Text("\(draft.count) karakter • \(segments) SMS")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                if !draft.isEmpty {
+                    let info = BridgeFormatters.smsSegmentInfo(for: draft)
+                    if info.segments > 1 || info.chars >= 50 {
+                        HStack {
+                            Spacer()
+                            Text("\(info.chars) karakter • \(info.segments) SMS\(info.isUnicode ? " • Unicode" : "")")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -827,17 +830,31 @@ struct SmsComposeSheet: View {
                 }
 
                 Section("Alıcı") {
-                    TextField("Ad veya numara (+905...)", text: $recipientQuery)
-                        .keyboardType(.phonePad)
-                        .onChange(of: recipientQuery) { _ in
-                            if selectedContactName != nil, !recipientQuery.isEmpty {
-                                // Clear matched contact badge if user manually edits the number.
-                                let dialable = BridgeFormatters.filterDialable(recipientQuery)
-                                if dialable != recipientQuery {
-                                    self.selectedContactName = nil
+                    HStack {
+                        TextField("Ad veya numara (+905...)", text: $recipientQuery)
+                            .keyboardType(.default)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.words)
+                            .onChange(of: recipientQuery) { _ in
+                                if selectedContactName != nil, !recipientQuery.isEmpty {
+                                    // Clear matched contact badge if user manually edits the number.
+                                    let dialable = BridgeFormatters.filterDialable(recipientQuery)
+                                    if dialable != recipientQuery {
+                                        self.selectedContactName = nil
+                                    }
                                 }
                             }
+                        if !recipientQuery.isEmpty {
+                            Button {
+                                recipientQuery = ""
+                                selectedContactName = nil
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
                         }
+                    }
                     if let selectedContactName {
                         HStack {
                             Image(systemName: "person.fill").foregroundStyle(.green)
@@ -876,8 +893,8 @@ struct SmsComposeSheet: View {
                     Text("Mesaj")
                 } footer: {
                     if !messageBody.isEmpty {
-                        let segments = max(1, (messageBody.count + 152) / 153)
-                        Text("\(messageBody.count) karakter • \(segments) SMS")
+                        let info = BridgeFormatters.smsSegmentInfo(for: messageBody)
+                        Text("\(info.chars) karakter • \(info.segments) SMS\(info.isUnicode ? " • Unicode" : "")")
                     }
                 }
             }

@@ -5,6 +5,7 @@ struct SimpleContact: Identifiable, Hashable {
     let id: String
     let name: String
     let numbers: [String]
+    var thumbnailData: Data? = nil
 }
 
 @MainActor
@@ -17,6 +18,8 @@ final class ContactsHelper: ObservableObject {
 
     private let store = CNContactStore()
     private var suffixIndex: [String: String] = [:]
+    private var thumbnailBySuffix: [String: Data] = [:]
+    private var contactIdBySuffix: [String: String] = [:]
     private var hasLoadedOnce = false
     private var storeObserver: NSObjectProtocol?
 
@@ -65,6 +68,7 @@ final class ContactsHelper: ObservableObject {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
         let digitQuery = trimmed.filter { $0.isNumber }
+        let pureDigits = (trimmed.count >= 2 && trimmed.allSatisfy(\.isNumber))
         var hits: [SimpleContact] = []
         for contact in contacts {
             let nameMatch = contact.name.localizedCaseInsensitiveContains(trimmed)
@@ -75,7 +79,8 @@ final class ContactsHelper: ObservableObject {
                 }
                 return false
             }
-            if nameMatch || numberMatch {
+            let t9Match = pureDigits && Self.t9Signature(contact.name).contains(trimmed)
+            if nameMatch || numberMatch || t9Match {
                 hits.append(contact)
                 if hits.count >= limit { break }
             }
@@ -87,6 +92,18 @@ final class ContactsHelper: ObservableObject {
         let suffix = Self.normalizeSuffix(number)
         guard suffix.count >= 7 else { return nil }
         return suffixIndex[suffix]
+    }
+
+    func thumbnailData(for number: String) -> Data? {
+        let suffix = Self.normalizeSuffix(number)
+        guard suffix.count >= 7 else { return nil }
+        return thumbnailBySuffix[suffix]
+    }
+
+    func contactIdentifier(for number: String) -> String? {
+        let suffix = Self.normalizeSuffix(number)
+        guard suffix.count >= 7 else { return nil }
+        return contactIdBySuffix[suffix]
     }
 
     func resolveTarget(for query: String) -> (number: String, name: String?)? {
@@ -113,35 +130,79 @@ final class ContactsHelper: ObservableObject {
             let keys: [CNKeyDescriptor] = [
                 CNContactIdentifierKey as CNKeyDescriptor,
                 CNContactGivenNameKey as CNKeyDescriptor,
+                CNContactMiddleNameKey as CNKeyDescriptor,
                 CNContactFamilyNameKey as CNKeyDescriptor,
                 CNContactOrganizationNameKey as CNKeyDescriptor,
-                CNContactPhoneNumbersKey as CNKeyDescriptor
+                CNContactPhoneNumbersKey as CNKeyDescriptor,
+                CNContactThumbnailImageDataKey as CNKeyDescriptor
             ]
-            let (sortedContacts, finalIndex): ([SimpleContact], [String: String]) = {
+            let (sortedContacts, finalIndex, finalThumbs, finalIds): ([SimpleContact], [String: String], [String: Data], [String: String]) = {
                 var loaded: [SimpleContact] = []
                 var idx: [String: String] = [:]
+                var thumbs: [String: Data] = [:]
+                var cids: [String: String] = [:]
                 let req = CNContactFetchRequest(keysToFetch: keys)
                 try? CNContactStore().enumerateContacts(with: req) { c, _ in
-                    let fullName = [c.givenName, c.familyName].filter { !$0.isEmpty }.joined(separator: " ")
+                    let fullName = [c.givenName, c.middleName, c.familyName]
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " ")
                         .ifEmpty(c.organizationName)
                     let nums = c.phoneNumbers.map { $0.value.stringValue }.filter { !$0.isEmpty }
                     guard !fullName.isEmpty, !nums.isEmpty else { return }
-                    loaded.append(SimpleContact(id: c.identifier, name: fullName, numbers: nums))
+                    let thumb = c.thumbnailImageData
+                    loaded.append(SimpleContact(id: c.identifier, name: fullName, numbers: nums, thumbnailData: thumb))
                     for n in nums {
                         let sfx = Self.normalizeSuffix(n)
                         if sfx.count >= 7 {
                             idx[sfx] = fullName
+                            cids[sfx] = c.identifier
+                            if let thumb {
+                                thumbs[sfx] = thumb
+                            }
                         }
                     }
                 }
                 loaded.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-                return (loaded, idx)
+                return (loaded, idx, thumbs, cids)
             }()
             await MainActor.run {
                 self.contacts = sortedContacts
                 self.suffixIndex = finalIndex
+                self.thumbnailBySuffix = finalThumbs
+                self.contactIdBySuffix = finalIds
             }
         }
+    }
+
+    nonisolated static func t9Signature(_ name: String) -> String {
+        let lower = name.lowercased(with: Locale(identifier: "tr_TR"))
+        var out = ""
+        out.reserveCapacity(lower.count)
+        for ch in lower {
+            switch ch {
+            case "a", "b", "c", "ç", "à", "á", "â", "ä":
+                out.append("2")
+            case "d", "e", "f", "è", "é", "ê", "ë":
+                out.append("3")
+            case "g", "ğ", "h", "i", "ı", "î", "ï", "í", "ì":
+                out.append("4")
+            case "j", "k", "l":
+                out.append("5")
+            case "m", "n", "o", "ö", "ñ", "ó", "ò", "ô":
+                out.append("6")
+            case "p", "q", "r", "s", "ş", "ß":
+                out.append("7")
+            case "t", "u", "ü", "v", "ú", "ù", "û":
+                out.append("8")
+            case "w", "x", "y", "z":
+                out.append("9")
+            case "0"..."9":
+                out.append(ch)
+            default:
+                break
+            }
+        }
+        return out
     }
 
     nonisolated static func normalizeSuffix(_ number: String) -> String {

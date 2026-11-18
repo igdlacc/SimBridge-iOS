@@ -216,7 +216,7 @@ struct RecentsView: View {
                             )
                         } label: {
                             HStack(spacing: 12) {
-                                AvatarCircle(title: c.name, size: 38, tint: .green)
+                                AvatarCircle(title: c.name, size: 38, tint: .green, imageData: c.thumbnailData)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(c.name)
                                         .font(.headline)
@@ -266,7 +266,7 @@ struct RecentsView: View {
                 } else {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 10) {
-                            AvatarCircle(title: c.name, size: 34, tint: .green)
+                            AvatarCircle(title: c.name, size: 34, tint: .green, imageData: c.thumbnailData)
                             Text(c.name)
                                 .font(.headline)
                         }

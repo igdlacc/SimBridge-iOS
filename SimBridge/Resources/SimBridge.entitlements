@@ -10,5 +10,7 @@
 	<true/>
 	<key>com.apple.developer.siri</key>
 	<true/>
+	<key>com.apple.developer.calling-app</key>
+	<true/>
 </dict>
 </plist>

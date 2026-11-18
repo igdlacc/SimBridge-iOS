@@ -16,6 +16,9 @@ final class PairingStore {
 
     private let account = "simbridge_pairing_v1"
     private let service = "com.simbridge.ios.keychain"
+    private let lock = NSLock()
+    private var cachedConfig: StoredPairingConfig?
+    private var hasLoadedCache = false
 
     private init() {}
 
@@ -26,16 +29,33 @@ final class PairingStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
+        lock.lock()
         SecItemDelete(query as CFDictionary)
 
         var attrs = query
         attrs[kSecValueData as String] = data
         // Available in background when locked (after first unlock) so VoIP PushKit works cleanly!
         attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(attrs as CFDictionary, nil)
+        let status = SecItemAdd(attrs as CFDictionary, nil)
+        if status == errSecSuccess {
+            cachedConfig = config
+            hasLoadedCache = true
+        } else {
+            cachedConfig = nil
+            hasLoadedCache = false
+        }
+        lock.unlock()
     }
 
     func load() -> StoredPairingConfig? {
+        lock.lock()
+        if hasLoadedCache {
+            let hit = cachedConfig
+            lock.unlock()
+            return hit
+        }
+        lock.unlock()
+
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -45,8 +65,16 @@ final class PairingStore {
         ]
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return try? JSONDecoder().decode(StoredPairingConfig.self, from: data)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            return nil
+        }
+        let decoded = (status == errSecSuccess ? (result as? Data) : nil)
+            .flatMap { try? JSONDecoder().decode(StoredPairingConfig.self, from: $0) }
+        lock.lock()
+        cachedConfig = decoded
+        hasLoadedCache = true
+        lock.unlock()
+        return decoded
     }
 
     func updateIps(
@@ -84,6 +112,10 @@ final class PairingStore {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
+        lock.lock()
         SecItemDelete(query as CFDictionary)
+        cachedConfig = nil
+        hasLoadedCache = true
+        lock.unlock()
     }
 }

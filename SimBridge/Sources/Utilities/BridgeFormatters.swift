@@ -130,4 +130,35 @@ enum BridgeFormatters {
     static func filterDialable(_ input: String) -> String {
         input.filter { $0.isNumber || $0 == "+" || $0 == "*" || $0 == "#" }
     }
+
+    private static let gsm7BasicChars: Set<Character> = Set(
+        "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ ÆæßÉ!\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+    )
+    private static let gsm7ExtendedChars: Set<Character> = Set("^{}\\[~]|€\u{000C}")
+
+    /// Computes exact GSM-7 (160/153, extended chars = 2) vs UCS-2 (70/67) SMS segment counts.
+    static func smsSegmentInfo(for text: String) -> (chars: Int, segments: Int, isUnicode: Bool) {
+        if text.isEmpty {
+            return (0, 0, false)
+        }
+        var gsmLength = 0
+        var isUnicode = false
+        for ch in text {
+            if gsm7BasicChars.contains(ch) {
+                gsmLength += 1
+            } else if gsm7ExtendedChars.contains(ch) {
+                gsmLength += 2
+            } else {
+                isUnicode = true
+                break
+            }
+        }
+        if isUnicode {
+            let uLen = text.utf16.count
+            let segs = uLen <= 70 ? 1 : (uLen + 66) / 67
+            return (uLen, segs, true)
+        }
+        let segs = gsmLength <= 160 ? 1 : (gsmLength + 152) / 153
+        return (gsmLength, segs, false)
+    }
 }

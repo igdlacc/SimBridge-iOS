@@ -17,15 +17,24 @@ struct AvatarCircle: View {
     let title: String
     var size: CGFloat = 42
     var tint: Color = .blue
+    var imageData: Data? = nil
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(tint.opacity(0.16))
+        if let imageData, let uiImg = UIImage(data: imageData) {
+            Image(uiImage: uiImg)
+                .resizable()
+                .scaledToFill()
                 .frame(width: size, height: size)
-            Text(BridgeFormatters.initials(for: title))
-                .font(.system(size: size * 0.38, weight: .semibold, design: .rounded))
-                .foregroundStyle(tint)
+                .clipShape(Circle())
+        } else {
+            ZStack {
+                Circle()
+                    .fill(tint.opacity(0.16))
+                    .frame(width: size, height: size)
+                Text(BridgeFormatters.initials(for: title))
+                    .font(.system(size: size * 0.38, weight: .semibold, design: .rounded))
+                    .foregroundStyle(tint)
+            }
         }
     }
 }
@@ -332,7 +341,12 @@ struct ActiveCallDetailSheet: View {
                     Spacer(minLength: 4)
 
                     VStack(spacing: 8) {
-                        AvatarCircle(title: name, size: 72, tint: isHeld ? .orange : .green)
+                        AvatarCircle(
+                            title: name,
+                            size: 72,
+                            tint: isHeld ? .orange : .green,
+                            imageData: contacts.thumbnailData(for: call.number)
+                        )
 
                         Text(name)
                             .font(.title2.weight(.bold))

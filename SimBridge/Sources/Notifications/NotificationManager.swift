@@ -1,4 +1,5 @@
 import Foundation
+import Intents
 import UIKit
 import UserNotifications
 
@@ -42,7 +43,7 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
     static let shared = NotificationManager()
 
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
-    private(set) var currentAlertTokenHex: String = ""
+    @Published private(set) var currentAlertTokenHex: String = ""
 
     private let dedupLock = NSLock()
     private var seenSmsEntries: [SeenSmsEntry] = []
@@ -126,6 +127,8 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
         let resolvedSender = ContactsHelper.shared.resolveName(for: sms.address)
             ?? (sms.contactName?.isEmpty == false ? sms.contactName! : sms.address)
+        let avatarData = ContactsHelper.shared.thumbnailData(for: sms.address)
+        let contactId = ContactsHelper.shared.contactIdentifier(for: sms.address)
         let otp = (sms.otpCode?.isEmpty == false) ? sms.otpCode : nil
         let address = sms.address
         let body = sms.body
@@ -177,8 +180,43 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             }
             content.userInfo = userInfo
 
+            let convId = normKey.isEmpty ? address : normKey
+            let senderHandle = INPersonHandle(
+                value: convId,
+                type: (!convId.isEmpty && convId.allSatisfy(\.isNumber)) ? .phoneNumber : .unknown
+            )
+            let senderAvatar = avatarData.map { INImage(imageData: $0) }
+            let senderPerson = INPerson(
+                personHandle: senderHandle,
+                nameComponents: nil,
+                displayName: resolvedSender,
+                image: senderAvatar,
+                contactIdentifier: contactId,
+                customIdentifier: convId
+            )
+            let sendIntent = INSendMessageIntent(
+                recipients: nil,
+                outgoingMessageType: .outgoingMessageText,
+                content: body,
+                speakableGroupName: nil,
+                conversationIdentifier: convId,
+                serviceName: "SimBridge",
+                sender: senderPerson,
+                attachments: nil
+            )
+            let interaction = INInteraction(intent: sendIntent, response: nil)
+            interaction.direction = .incoming
+            interaction.donate(completion: nil)
+
+            let finalContent: UNNotificationContent
+            do {
+                finalContent = try content.updating(from: sendIntent)
+            } catch {
+                finalContent = content
+            }
+
             let reqId = "simbridge-local-sms-\(cleanId ?? UUID().uuidString)"
-            let req = UNNotificationRequest(identifier: reqId, content: content, trigger: nil)
+            let req = UNNotificationRequest(identifier: reqId, content: finalContent, trigger: nil)
             try? await center.add(req)
         }
     }
@@ -252,7 +290,13 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
     func didRegisterRemoteToken(_ deviceToken: Data) {
         let hex = deviceToken.map { String(format: "%02x", $0) }.joined()
-        currentAlertTokenHex = hex
+        if Thread.isMainThread {
+            currentAlertTokenHex = hex
+        } else {
+            DispatchQueue.main.async {
+                self.currentAlertTokenHex = hex
+            }
+        }
         Task { @MainActor in
             BridgeClient.shared.updatePushTokens(alertToken: hex)
         }

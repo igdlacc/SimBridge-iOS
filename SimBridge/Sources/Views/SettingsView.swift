@@ -8,6 +8,7 @@ struct SettingsView: View {
     @ObservedObject private var audio = AudioEngineManager.shared
     @ObservedObject private var notifications = NotificationManager.shared
     @ObservedObject private var locationKeepAlive = LocationKeepAliveManager.shared
+    @ObservedObject private var voipPush = VoipPushManager.shared
 
     @State private var showingScanner = false
     @State private var copiedAudioLog = false
@@ -116,7 +117,7 @@ struct SettingsView: View {
                 Section("Push Tokenları & İzinler") {
                     LabeledContent(
                         "VoIP PushKit",
-                        value: VoipPushManager.shared.currentVoipTokenHex.isEmpty ? "Bekleniyor" : "Hazır ✓"
+                        value: voipPush.currentVoipTokenHex.isEmpty ? "Bekleniyor" : "Hazır ✓"
                     )
                     LabeledContent(
                         "SMS Alert APNs",
@@ -162,6 +163,8 @@ struct SettingsView: View {
                         }
                         .foregroundStyle(.orange)
                     }
+                    LabeledContent("Bundle ID", value: Bundle.main.bundleIdentifier ?? "com.simbridge.ios")
+                    LabeledContent("Varsayılan Arama", value: "Ayarlar > Uygulamalar > Saptanmış > Arama")
                     LabeledContent("CallKit & Kişiler", value: "Aktif (Ara'ya basılı tut → SimBridge)")
                     LabeledContent("Siri & tel:// Bağlantıları", value: "Destekleniyor ✓")
                 }
