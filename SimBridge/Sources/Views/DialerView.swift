@@ -28,6 +28,14 @@ struct DialerView: View {
         return contacts.resolveName(for: numberText)
     }
 
+    private var lastDialedNumber: String? {
+        let raw = bridge.recentCalls.first(where: { $0.type == "outgoing" && !$0.number.isEmpty })?.number
+            ?? bridge.recentCalls.first(where: { !$0.number.isEmpty })?.number
+        guard let raw else { return nil }
+        let filtered = BridgeFormatters.filterDialable(raw)
+        return filtered.isEmpty ? nil : filtered
+    }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 10) {
@@ -180,7 +188,13 @@ struct DialerView: View {
                     }
 
                     Button {
-                        guard !numberText.isEmpty else { return }
+                        if numberText.isEmpty {
+                            if let redial = lastDialedNumber {
+                                SimHaptics.tap(.light)
+                                numberText = redial
+                            }
+                            return
+                        }
                         SimHaptics.tap(.medium)
                         let validSim = bridge.validatedSimSlot(selectedSimSlot)
                         CallKitManager.shared.startOutgoingCall(
@@ -196,7 +210,8 @@ struct DialerView: View {
                             .background(callButtonColor)
                             .clipShape(Circle())
                     }
-                    .disabled(!bridge.isPaired || numberText.isEmpty)
+                    .disabled(!bridge.isPaired || (numberText.isEmpty && lastDialedNumber == nil))
+                    .accessibilityLabel(numberText.isEmpty ? "Son Arananı Getir" : "Ara")
 
                     Button {
                         SimHaptics.tap(.light)
@@ -239,7 +254,7 @@ struct DialerView: View {
     }
 
     private var callButtonColor: Color {
-        if !bridge.isPaired || numberText.isEmpty { return .gray }
+        if !bridge.isPaired || (numberText.isEmpty && lastDialedNumber == nil) { return .gray }
         return bridge.isConnected ? .green : .orange
     }
 

@@ -51,13 +51,25 @@ struct SmsView: View {
     @AppStorage("simbridge.preferredSimSlot") private var selectedSimSlot: Int = 0
 
     @State private var searchText: String = ""
+    @State private var smsFilter: Int = 0 // 0 = Tümü, 1 = Okunmamış
     @State private var showingCompose: Bool = false
     @State private var copiedOtpBanner: String?
+
+    private var totalUnreadCount: Int {
+        bridge.smsMessages.filter { !$0.isOutgoing && !$0.isRead }.count
+    }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 6) {
                 ConnectionStatusPill()
+
+                Picker("Filtre", selection: $smsFilter) {
+                    Text("Tümü").tag(0)
+                    Text(totalUnreadCount > 0 ? "Okunmamış (\(totalUnreadCount))" : "Okunmamış").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
 
                 if threads.isEmpty {
                     emptyThreadsView
@@ -67,6 +79,17 @@ struct SmsView: View {
                             SmsConversationView(address: thread.address, title: thread.displayName)
                         } label: {
                             threadRow(thread)
+                        }
+                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                            if thread.unreadCount > 0 {
+                                Button {
+                                    SimHaptics.tap(.light)
+                                    bridge.markConversationRead(address: thread.address)
+                                } label: {
+                                    Label("Okundu", systemImage: "envelope.open.fill")
+                                }
+                                .tint(.blue)
+                            }
                         }
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             Button {
@@ -146,6 +169,16 @@ struct SmsView: View {
                 }
             }
             .toolbar {
+                if totalUnreadCount > 0 {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            SimHaptics.notify(.success)
+                            bridge.markAllConversationsRead()
+                        } label: {
+                            Label("Tümünü Okundu İşaretle", systemImage: "checkmark.circle")
+                        }
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         SimHaptics.tap(.light)
@@ -251,7 +284,8 @@ struct SmsView: View {
                 .foregroundStyle(.secondary)
             Text(
                 !searchText.isEmpty ? "Eşleşen Mesaj Bulunamadı"
-                    : (!bridge.isPaired ? "Önce Android ile Eşleştirin" : "Henüz SMS Yok")
+                    : (!bridge.isPaired ? "Önce Android ile Eşleştirin"
+                        : (smsFilter == 1 ? "Okunmamış SMS Yok" : "Henüz SMS Yok"))
             )
             .font(.headline)
             if bridge.isPaired && bridge.smsMessages.isEmpty {
@@ -339,6 +373,9 @@ struct SmsView: View {
         }
 
         out.sort { $0.latestTimestampMs > $1.latestTimestampMs }
+        if smsFilter == 1 {
+            out = out.filter { $0.unreadCount > 0 }
+        }
         guard !searchText.isEmpty else { return out }
         return out.filter { thread in
             thread.displayName.localizedCaseInsensitiveContains(searchText) ||
@@ -615,6 +652,20 @@ struct SmsConversationView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .tint(.green)
+                }
+
+                let webUrls = BridgeFormatters.extractWebUrls(from: m.body)
+                if !webUrls.isEmpty {
+                    ForEach(webUrls.prefix(2), id: \.absoluteString) { url in
+                        Link(destination: url) {
+                            Label(BridgeFormatters.shortUrlLabel(url), systemImage: "safari")
+                                .font(.caption2.weight(.semibold))
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(.blue)
+                    }
                 }
             }
 

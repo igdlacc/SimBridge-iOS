@@ -6,17 +6,62 @@ struct QrScannerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var manualJson: String = ""
     @State private var errorMsg: String?
+    @State private var cameraAuthStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
 
     let onScanned: (String) -> Bool
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
-                CameraQrView { code in
-                    if onScanned(code) {
-                        dismiss()
-                    } else {
-                        errorMsg = "Geçersiz SimBridge QR kodu"
+                Group {
+                    switch cameraAuthStatus {
+                    case .authorized:
+                        CameraQrView { code in
+                            if onScanned(code) {
+                                SimHaptics.notify(.success)
+                                dismiss()
+                                return true
+                            } else {
+                                SimHaptics.notify(.error)
+                                errorMsg = "Geçersiz SimBridge QR kodu — tekrar tarayın"
+                                return false
+                            }
+                        }
+                    case .notDetermined:
+                        VStack(spacing: 10) {
+                            ProgressView()
+                            Text("Kamera izni isteniyor...")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(.secondarySystemBackground))
+                        .onAppear {
+                            AVCaptureDevice.requestAccess(for: .video) { granted in
+                                DispatchQueue.main.async {
+                                    cameraAuthStatus = granted ? .authorized : .denied
+                                }
+                            }
+                        }
+                    default:
+                        VStack(spacing: 10) {
+                            Image(systemName: "camera.fill")
+                                .font(.title)
+                                .foregroundStyle(.secondary)
+                            Text("QR taramak için kamera izni kapalı.")
+                                .font(.footnote.weight(.medium))
+                                .multilineTextAlignment(.center)
+                            Button("Ayarları Aç") {
+                                if let url = URL(string: UIApplication.openSettingsURLString) {
+                                    UIApplication.shared.open(url)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        }
+                        .padding()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(.secondarySystemBackground))
                     }
                 }
                 .frame(height: 290)
@@ -41,8 +86,10 @@ struct QrScannerSheet: View {
                         if let str = UIPasteboard.general.string {
                             manualJson = str
                             if onScanned(str) {
+                                SimHaptics.notify(.success)
                                 dismiss()
                             } else {
+                                SimHaptics.notify(.error)
                                 errorMsg = "Panodaki metin geçerli bir SimBridge QR JSON değil."
                             }
                         }
@@ -51,8 +98,10 @@ struct QrScannerSheet: View {
 
                     Button("Bağlan") {
                         if onScanned(manualJson) {
+                            SimHaptics.notify(.success)
                             dismiss()
                         } else {
+                            SimHaptics.notify(.error)
                             errorMsg = "Geçersiz eşleştirme JSON verisi."
                         }
                     }
@@ -63,6 +112,9 @@ struct QrScannerSheet: View {
             }
             .padding()
             .navigationTitle("Android Eşleştir")
+            .onAppear {
+                cameraAuthStatus = AVCaptureDevice.authorizationStatus(for: .video)
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Kapat") { dismiss() }
@@ -73,7 +125,7 @@ struct QrScannerSheet: View {
 }
 
 struct CameraQrView: UIViewControllerRepresentable {
-    let onCode: (String) -> Void
+    let onCode: (String) -> Bool
 
     func makeUIViewController(context: Context) -> QrScannerVC {
         let vc = QrScannerVC()
@@ -81,10 +133,12 @@ struct CameraQrView: UIViewControllerRepresentable {
         return vc
     }
 
-    func updateUIViewController(_ uiViewController: QrScannerVC, context: Context) {}
+    func updateUIViewController(_ uiViewController: QrScannerVC, context: Context) {
+        uiViewController.onCode = onCode
+    }
 
     final class QrScannerVC: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
-        var onCode: ((String) -> Void)?
+        var onCode: ((String) -> Bool)?
         private let session = AVCaptureSession()
         private var previewLayer: AVCaptureVideoPreviewLayer?
         private var didEmit = false
@@ -137,7 +191,16 @@ struct CameraQrView: UIViewControllerRepresentable {
                   let value = obj.stringValue else { return }
             didEmit = true
             session.stopRunning()
-            onCode?(value)
+            let accepted = onCode?(value) ?? false
+            if !accepted {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    guard let self, self.view.window != nil else { return }
+                    self.didEmit = false
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                        self?.session.startRunning()
+                    }
+                }
+            }
         }
     }
 }

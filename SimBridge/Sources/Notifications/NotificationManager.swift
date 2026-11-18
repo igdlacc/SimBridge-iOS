@@ -44,13 +44,27 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
 
     @Published private(set) var authorizationStatus: UNAuthorizationStatus = .notDetermined
     @Published private(set) var currentAlertTokenHex: String = ""
+    @Published var lowBatteryAlertEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(lowBatteryAlertEnabled, forKey: Self.lowBatteryAlertPrefKey)
+        }
+    }
 
     private let dedupLock = NSLock()
     private var seenSmsEntries: [SeenSmsEntry] = []
     private var activeViewingKey: String? = nil
+    private var lowBatteryAlertSentInCycle: Bool = false
+    private var lastLowBatteryAlertAt: Date = .distantPast
     private static let dedupTtlSeconds: TimeInterval = 120.0
+    private static let lowBatteryAlertPrefKey = "simbridge.lowBatteryAlertEnabled"
 
     private override init() {
+        if UserDefaults.standard.object(forKey: Self.lowBatteryAlertPrefKey) == nil {
+            self.lowBatteryAlertEnabled = true
+            UserDefaults.standard.set(true, forKey: Self.lowBatteryAlertPrefKey)
+        } else {
+            self.lowBatteryAlertEnabled = UserDefaults.standard.bool(forKey: Self.lowBatteryAlertPrefKey)
+        }
         super.init()
     }
 
@@ -237,6 +251,61 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
         }
     }
 
+    func clearAllDeliveredSmsNotifications() {
+        Task {
+            let center = UNUserNotificationCenter.current()
+            let delivered = await center.deliveredNotifications()
+            let smsIds = delivered.compactMap { notif -> String? in
+                let info = notif.request.content.userInfo
+                if info["address"] != nil || info["smsId"] != nil {
+                    return notif.request.identifier
+                }
+                return nil
+            }
+            if !smsIds.isEmpty {
+                center.removeDeliveredNotifications(withIdentifiers: smsIds)
+            }
+        }
+    }
+
+    func handleGatewayBatteryStatus(deviceName: String, batteryPct: Int, isCharging: Bool) {
+        guard batteryPct > 0 else { return }
+        let now = Date()
+        var shouldNotify = false
+        dedupLock.lock()
+        if isCharging || batteryPct >= 25 {
+            lowBatteryAlertSentInCycle = false
+        } else if batteryPct <= 15
+                    && !lowBatteryAlertSentInCycle
+                    && now.timeIntervalSince(lastLowBatteryAlertAt) >= 1800 {
+            let enabled = UserDefaults.standard.object(forKey: Self.lowBatteryAlertPrefKey) == nil
+                ? true
+                : UserDefaults.standard.bool(forKey: Self.lowBatteryAlertPrefKey)
+            if enabled {
+                lowBatteryAlertSentInCycle = true
+                lastLowBatteryAlertAt = now
+                shouldNotify = true
+            }
+        }
+        dedupLock.unlock()
+
+        guard shouldNotify else { return }
+        Task {
+            let content = UNMutableNotificationContent()
+            content.title = "Redmi Pili Düşük (%\(batteryPct))"
+            let label = deviceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Android Gateway" : deviceName
+            content.body = "\(label) pil seviyesi kritik. Köprünün kesilmemesi için şarja takın."
+            content.sound = .default
+            content.interruptionLevel = .timeSensitive
+            let req = UNNotificationRequest(
+                identifier: "simbridge-gateway-low-battery",
+                content: content,
+                trigger: nil
+            )
+            try? await UNUserNotificationCenter.current().add(req)
+        }
+    }
+
     func refreshAuthorizationStatus() {
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             let status = settings.authorizationStatus
@@ -263,16 +332,21 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
             textInputButtonTitle: "Gönder",
             textInputPlaceholder: "SMS mesajı..."
         )
+        let markReadAction = UNNotificationAction(
+            identifier: "MARK_READ",
+            title: "Okundu İşaretle",
+            options: []
+        )
 
         let otpCategory = UNNotificationCategory(
             identifier: "SMS_OTP",
-            actions: [copyAction, replyAction],
+            actions: [copyAction, replyAction, markReadAction],
             intentIdentifiers: [],
             options: []
         )
         let msgCategory = UNNotificationCategory(
             identifier: "SMS_MESSAGE",
-            actions: [replyAction],
+            actions: [replyAction, markReadAction],
             intentIdentifiers: [],
             options: []
         )
@@ -359,6 +433,17 @@ final class NotificationManager: NSObject, ObservableObject, UNUserNotificationC
            let otp = info["otpCode"] as? String,
            !otp.isEmpty {
             UIPasteboard.general.string = otp
+        } else if response.actionIdentifier == "MARK_READ",
+                  let address = info["address"] as? String,
+                  !address.isEmpty {
+            let bgToken = BgTaskToken()
+            bgToken.start(name: "SimBridgeMarkSmsRead")
+            Task { @MainActor in
+                await BridgeClient.shared.markConversationReadAsync(address: address, forceRemoteSync: true)
+                completionHandler()
+                bgToken.end()
+            }
+            return
         } else if response.actionIdentifier == "QUICK_REPLY",
                   let textResp = response as? UNTextInputNotificationResponse,
                   let address = info["address"] as? String {

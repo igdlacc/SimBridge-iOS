@@ -1,5 +1,18 @@
+import AVKit
 import SwiftUI
 import UIKit
+
+struct AudioRoutePickerView: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.prioritizesVideoDevices = false
+        picker.tintColor = .label
+        picker.activeTintColor = .systemBlue
+        return picker
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
+}
 
 enum SimHaptics {
     static func tap(_ style: UIImpactFeedbackGenerator.FeedbackStyle = .light) {
@@ -66,12 +79,12 @@ struct ConnectionStatusPill: View {
 
             if let st = bridge.deviceStatus {
                 HStack(spacing: 3) {
-                    Image(systemName: st.isCharging ? "battery.100.bolt" : "battery.75")
+                    Image(systemName: batterySymbol(pct: st.batteryPct, charging: st.isCharging))
                         .font(.caption2)
                     Text("\(st.batteryPct)%")
                         .font(.caption.monospacedDigit())
                 }
-                .foregroundStyle(.secondary)
+                .foregroundStyle(batteryColor(pct: st.batteryPct, charging: st.isCharging))
             } else if bridge.isPaired && !bridge.isConnected {
                 Button {
                     SimHaptics.tap(.light)
@@ -95,6 +108,24 @@ struct ConnectionStatusPill: View {
         if bridge.isConnected { return .green }
         if bridge.isPaired { return .orange }
         return .gray
+    }
+
+    private func batterySymbol(pct: Int, charging: Bool) -> String {
+        if charging { return "battery.100.bolt" }
+        switch pct {
+        case 85...100: return "battery.100"
+        case 60..<85: return "battery.75"
+        case 35..<60: return "battery.50"
+        case 15..<35: return "battery.25"
+        default: return "battery.0"
+        }
+    }
+
+    private func batteryColor(pct: Int, charging: Bool) -> Color {
+        if charging { return .green }
+        if pct <= 15 { return .red }
+        if pct <= 25 { return .orange }
+        return .secondary
     }
 }
 
@@ -537,6 +568,11 @@ struct ActiveCallDetailSheet: View {
                 .navigationTitle("Aktif Arama")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        AudioRoutePickerView()
+                            .frame(width: 34, height: 34)
+                            .accessibilityLabel("Ses Çıkışı Seç")
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Kapat") { dismiss() }
                     }

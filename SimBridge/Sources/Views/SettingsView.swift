@@ -99,7 +99,12 @@ struct SettingsView: View {
                 if let st = bridge.deviceStatus {
                     Section("Android Gateway Sağlığı") {
                         LabeledContent("Cihaz", value: st.deviceName)
-                        LabeledContent("Pil", value: "\(st.batteryPct)% \(st.isCharging ? "⚡" : "")")
+                        LabeledContent("Pil") {
+                            Text("\(st.batteryPct)% \(st.isCharging ? "⚡" : "")")
+                                .foregroundStyle(
+                                    st.isCharging ? .green : (st.batteryPct <= 15 ? .red : (st.batteryPct <= 25 ? .orange : .secondary))
+                                )
+                        }
                         LabeledContent("Priv-App Ses Yetkisi", value: st.isPrivileged ? "Aktif ✓" : "Eksik ✕")
                         LabeledContent("InCallService", value: st.inCallServiceBound ? "Bağlı ✓" : "Arama Bekleniyor")
                         LabeledContent("Ses Profili", value: st.audioProfile)
@@ -146,6 +151,7 @@ struct SettingsView: View {
 
                 Section("iOS Entegrasyon & Arka Plan") {
                     Toggle("Ölümsüz Arka Plan (3km Düşük Güç Konum)", isOn: $locationKeepAlive.isEnabled)
+                    Toggle("Redmi Düşük Pil Uyarısı (≤%15)", isOn: $notifications.lowBatteryAlertEnabled)
                     LabeledContent("Konum Keep-Alive") {
                         Text(locationStatusLabel)
                             .foregroundStyle(locationStatusColor)

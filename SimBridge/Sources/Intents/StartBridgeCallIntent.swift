@@ -14,15 +14,38 @@ struct StartBridgeCallIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult {
         BridgeClient.shared.handleAppBecameActive()
+        let simSlot = BridgeClient.shared.validatedSimSlot(
+            UserDefaults.standard.integer(forKey: "simbridge.preferredSimSlot")
+        )
         if let resolved = ContactsHelper.shared.resolveTarget(for: target) {
-            CallKitManager.shared.startOutgoingCall(number: resolved.number, contactName: resolved.name)
+            CallKitManager.shared.startOutgoingCall(
+                number: resolved.number,
+                contactName: resolved.name,
+                simSlot: simSlot
+            )
         } else {
             CallKitManager.shared.startOutgoingCall(
                 number: target,
-                contactName: ContactsHelper.shared.resolveName(for: target)
+                contactName: ContactsHelper.shared.resolveName(for: target),
+                simSlot: simSlot
             )
         }
         return .result()
+    }
+}
+
+@available(iOS 16.0, *)
+struct SimBridgeShortcuts: AppShortcutsProvider {
+    static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: StartBridgeCallIntent(),
+            phrases: [
+                "\(.applicationName) ile ara",
+                "\(.applicationName) arama yap"
+            ],
+            shortTitle: "SimBridge ile Ara",
+            systemImageName: "phone.fill"
+        )
     }
 }
 #endif

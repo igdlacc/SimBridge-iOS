@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import UIKit
+import UserNotifications
 
 /// Off-MainActor real-time UDP audio transport so CoreAudio/Opus threads never contend on @MainActor.
 final class UdpAudioTransport: @unchecked Sendable {
@@ -298,6 +299,8 @@ final class BridgeClient: ObservableObject {
     private init() {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = false
+        // Mark control WebSocket traffic as VoIP call signaling for Wi-Fi WMM QoS prioritization.
+        cfg.networkServiceType = .callSignaling
         // Background keepalive runs every 45s (12s foreground), so use 120s request timeout.
         cfg.timeoutIntervalForRequest = 120
         urlSession = URLSession(configuration: cfg)
@@ -361,6 +364,12 @@ final class BridgeClient: ObservableObject {
         pingLatencyMs = nil
         lastSyncAt = nil
         statusBanner = "Eşleştirme kaldırıldı"
+        syncAppIconBadge()
+    }
+
+    func syncAppIconBadge() {
+        let unread = smsMessages.filter { !$0.isOutgoing && !$0.isRead }.count
+        UNUserNotificationCenter.current().setBadgeCount(unread, withCompletionHandler: nil)
     }
 
     var availableSims: [SimSlotDto] {
@@ -446,6 +455,12 @@ final class BridgeClient: ObservableObject {
     }
 
     func markConversationRead(address: String) {
+        Task { @MainActor [weak self] in
+            await self?.markConversationReadAsync(address: address, forceRemoteSync: false)
+        }
+    }
+
+    func markConversationReadAsync(address: String, forceRemoteSync: Bool = true) async {
         let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         NotificationManager.shared.clearDeliveredNotifications(forAddress: trimmed)
@@ -466,14 +481,38 @@ final class BridgeClient: ObservableObject {
                 }
             }
         }
-        guard changedCount > 0 else { return }
+        guard changedCount > 0 || forceRemoteSync else { return }
         let effectiveTs = max(maxTs, Int64(Date().timeIntervalSince1970 * 1000))
         localReadTimestamps[key] = effectiveTs
+        syncAppIconBadge()
         scheduleEncryptedCacheSave()
 
         let cmd = BridgeWsMessage(type: "mark_sms_read", address: trimmed, sinceMs: effectiveTs)
+        _ = await sendReliableCommand(cmd, timeoutSec: 4.0)
+    }
+
+    func markAllConversationsRead() {
+        NotificationManager.shared.clearAllDeliveredSmsNotifications()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        var changedCount = 0
+        for i in smsMessages.indices {
+            if !smsMessages[i].isOutgoing && !smsMessages[i].isRead {
+                smsMessages[i].isRead = true
+                changedCount += 1
+            }
+            let key = ContactsHelper.normalizeAddressKey(smsMessages[i].address)
+            if !key.isEmpty {
+                let ts = max(smsMessages[i].timestampMs, nowMs)
+                localReadTimestamps[key] = max(localReadTimestamps[key] ?? 0, ts)
+            }
+        }
+        syncAppIconBadge()
+        if changedCount > 0 {
+            scheduleEncryptedCacheSave()
+        }
+        let cmd = BridgeWsMessage(type: "mark_all_sms_read", sinceMs: nowMs)
         Task { @MainActor [weak self] in
-            _ = await self?.sendReliableCommand(cmd, timeoutSec: 4.0)
+            _ = await self?.sendReliableCommand(cmd, timeoutSec: 4.5)
         }
     }
 
@@ -1237,16 +1276,27 @@ final class BridgeClient: ObservableObject {
             if let sms = wsMsg.smsList {
                 smsMessages = applyLocalReadState(to: sms)
                 reconcilePendingSms(with: smsMessages)
+                syncAppIconBadge()
             }
             if let st = wsMsg.status {
                 deviceStatus = st
                 cachedSims = st.sims
+                NotificationManager.shared.handleGatewayBatteryStatus(
+                    deviceName: st.deviceName,
+                    batteryPct: st.batteryPct,
+                    isCharging: st.isCharging
+                )
             }
             scheduleEncryptedCacheSave()
         case "device_status":
             if let st = wsMsg.status {
                 deviceStatus = st
                 cachedSims = st.sims
+                NotificationManager.shared.handleGatewayBatteryStatus(
+                    deviceName: st.deviceName,
+                    batteryPct: st.batteryPct,
+                    isCharging: st.isCharging
+                )
             }
         case "call_state":
             if let c = wsMsg.call {
@@ -1287,6 +1337,7 @@ final class BridgeClient: ObservableObject {
                 if !alreadyExists {
                     let adjusted = applyLocalReadState(to: [sms]).first ?? sms
                     smsMessages.insert(adjusted, at: 0)
+                    syncAppIconBadge()
                     scheduleEncryptedCacheSave()
                     if !adjusted.isOutgoing {
                         NotificationManager.shared.handleIncomingLocalSms(adjusted)
@@ -1419,6 +1470,7 @@ final class BridgeClient: ObservableObject {
         }
         recentCalls = snap.recentCalls
         smsMessages = applyLocalReadState(to: snap.smsMessages)
+        syncAppIconBadge()
         if let sims = snap.sims { cachedSims = sims }
         if snap.savedAtMs > 0 {
             lastSyncAt = Date(timeIntervalSince1970: Double(snap.savedAtMs) / 1000.0)

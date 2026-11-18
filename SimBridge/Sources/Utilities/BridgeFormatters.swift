@@ -161,4 +161,39 @@ enum BridgeFormatters {
         let segs = gsmLength <= 160 ? 1 : (gsmLength + 152) / 153
         return (gsmLength, segs, false)
     }
+
+    private static let linkDetector: NSDataDetector? = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.link.rawValue
+    )
+
+    static func extractWebUrls(from text: String) -> [URL] {
+        guard !text.isEmpty, let detector = linkDetector else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        var urls: [URL] = []
+        var seen: Set<String> = []
+        detector.enumerateMatches(in: text, options: [], range: range) { match, _, _ in
+            guard let url = match?.url,
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else {
+                return
+            }
+            let abs = url.absoluteString
+            if seen.insert(abs).inserted {
+                urls.append(url)
+            }
+        }
+        return urls
+    }
+
+    static func shortUrlLabel(_ url: URL) -> String {
+        if let host = url.host, !host.isEmpty {
+            let cleanHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+            let path = url.path
+            if path.count > 1 && path.count <= 18 {
+                return "\(cleanHost)\(path)"
+            }
+            return cleanHost
+        }
+        return url.absoluteString
+    }
 }

@@ -149,14 +149,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 
         Task { @MainActor in
             BridgeClient.shared.handleAppBecameActive()
+            let simSlot = BridgeClient.shared.validatedSimSlot(
+                UserDefaults.standard.integer(forKey: "simbridge.preferredSimSlot")
+            )
             if let resolved = ContactsHelper.shared.resolveTarget(for: targetQuery) {
                 CallKitManager.shared.startOutgoingCall(
                     number: resolved.number,
-                    contactName: resolved.name ?? fallbackName
+                    contactName: resolved.name ?? fallbackName,
+                    simSlot: simSlot
                 )
             } else {
                 let name = ContactsHelper.shared.resolveName(for: targetQuery) ?? fallbackName
-                CallKitManager.shared.startOutgoingCall(number: targetQuery, contactName: name)
+                CallKitManager.shared.startOutgoingCall(number: targetQuery, contactName: name, simSlot: simSlot)
             }
         }
         return true
@@ -194,11 +198,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 
         Task { @MainActor in
             BridgeClient.shared.handleAppBecameActive()
+            let simSlot = BridgeClient.shared.validatedSimSlot(
+                UserDefaults.standard.integer(forKey: "simbridge.preferredSimSlot")
+            )
             if let resolved = ContactsHelper.shared.resolveTarget(for: rawTarget) {
-                CallKitManager.shared.startOutgoingCall(number: resolved.number, contactName: resolved.name)
+                CallKitManager.shared.startOutgoingCall(
+                    number: resolved.number,
+                    contactName: resolved.name,
+                    simSlot: simSlot
+                )
             } else {
                 let name = ContactsHelper.shared.resolveName(for: rawTarget)
-                CallKitManager.shared.startOutgoingCall(number: rawTarget, contactName: name)
+                CallKitManager.shared.startOutgoingCall(number: rawTarget, contactName: name, simSlot: simSlot)
             }
         }
     }

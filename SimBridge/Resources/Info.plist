@@ -69,7 +69,6 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.simbridge.ios.refresh</string>
-		<string>com.sait.dist.refresh</string>
 	</array>
 	<key>UIBackgroundModes</key>
 	<array>
