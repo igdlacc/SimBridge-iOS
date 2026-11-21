@@ -54,6 +54,7 @@ struct AvatarCircle: View {
 
 struct ConnectionStatusPill: View {
     @ObservedObject private var bridge = BridgeClient.shared
+    @ObservedObject private var locationKeepAlive = LocationKeepAliveManager.shared
 
     var body: some View {
         HStack(spacing: 8) {
@@ -75,7 +76,25 @@ struct ConnectionStatusPill: View {
                     .clipShape(Capsule())
             }
 
+            if locationKeepAlive.isLowPowerModeEnabled || (bridge.deviceStatus?.powerSaveMode == true) {
+                Text("Düşük Güç")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.16))
+                    .clipShape(Capsule())
+            }
+
             Spacer(minLength: 4)
+
+            if bridge.isPaired && !bridge.isConnected {
+                Image(systemName: "arrow.clockwise")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
 
             if let st = bridge.deviceStatus {
                 HStack(spacing: 3) {
@@ -85,22 +104,19 @@ struct ConnectionStatusPill: View {
                         .font(.caption.monospacedDigit())
                 }
                 .foregroundStyle(batteryColor(pct: st.batteryPct, charging: st.isCharging))
-            } else if bridge.isPaired && !bridge.isConnected {
-                Button {
-                    SimHaptics.tap(.light)
-                    bridge.connectNow(force: true, sweepSubnet: true)
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption.weight(.semibold))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.orange)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
         .background(Color(.secondarySystemBackground))
         .clipShape(Capsule())
+        .contentShape(Capsule())
+        .onTapGesture {
+            guard bridge.isPaired && !bridge.isConnected else { return }
+            SimHaptics.tap(.light)
+            bridge.resetConnectionCleanly()
+        }
+        .accessibilityAddTraits(bridge.isPaired && !bridge.isConnected ? .isButton : [])
         .padding(.horizontal)
     }
 
@@ -350,6 +366,8 @@ struct ActiveCallDetailSheet: View {
 
     @State private var showDtmfPad = false
     @State private var dtmfInput = ""
+    @State private var showAudioRefreshToast = false
+    @State private var audioRefreshToastTask: Task<Void, Never>?
 
     private let dtmfKeys: [[(String, String)]] = [
         [("1", ""), ("2", "ABC"), ("3", "DEF")],
@@ -569,13 +587,57 @@ struct ActiveCallDetailSheet: View {
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) {
-                        AudioRoutePickerView()
-                            .frame(width: 34, height: 34)
-                            .accessibilityLabel("Ses Çıkışı Seç")
+                        HStack(spacing: 12) {
+                            AudioRoutePickerView()
+                                .frame(width: 34, height: 34)
+                                .accessibilityLabel("Ses Çıkışı Seç")
+
+                            Button {
+                                SimHaptics.tap(.medium)
+                                CallKitManager.shared.forceRefreshCallAudio()
+                                audioRefreshToastTask?.cancel()
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    showAudioRefreshToast = true
+                                }
+                                audioRefreshToastTask = Task { @MainActor in
+                                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                    guard !Task.isCancelled else { return }
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        showAudioRefreshToast = false
+                                    }
+                                }
+                            } label: {
+                                Label("Sesi Yenile", systemImage: "arrow.clockwise.circle")
+                                    .labelStyle(.iconOnly)
+                                    .font(.title3)
+                            }
+                            .accessibilityLabel("Sesi Yenile")
+                        }
                     }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Kapat") { dismiss() }
                     }
+                }
+                .overlay(alignment: .top) {
+                    if showAudioRefreshToast {
+                        HStack(spacing: 6) {
+                            Image(systemName: "waveform.circle.fill")
+                                .font(.caption)
+                            Text("Ses yenileniyor...")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Color.blue.opacity(0.92))
+                        .clipShape(Capsule())
+                        .shadow(radius: 4, y: 2)
+                        .padding(.top, 8)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }
+                .onDisappear {
+                    audioRefreshToastTask?.cancel()
                 }
             } else {
                 Color.clear.onAppear { dismiss() }

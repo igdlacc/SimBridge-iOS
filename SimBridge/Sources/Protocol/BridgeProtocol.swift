@@ -76,6 +76,8 @@ struct DeviceStatusDto: Codable {
     let udpRxPackets: Int64
     let udpTxPackets: Int64
     let plcFrames: Int64
+    let powerSaveMode: Bool?
+    let lastApnsSummary: String?
 }
 
 struct EncryptedWsEnvelope: Codable {

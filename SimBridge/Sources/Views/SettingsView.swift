@@ -35,8 +35,11 @@ struct SettingsView: View {
     }
 
     private var locationStatusLabel: String {
-        if !locationKeepAlive.isEnabled {
-            return "Devre Dışı"
+        if locationKeepAlive.mode == .apnsBatterySaver {
+            return "Pil Dostu (APNs + Anlamlı Konum)"
+        }
+        if locationKeepAlive.isPausedForLowPower {
+            return "Düşük Güç Nedeniyle Duraklatıldı"
         }
         switch locationKeepAlive.authorizationStatus {
         case .authorizedAlways:
@@ -53,7 +56,12 @@ struct SettingsView: View {
     }
 
     private var locationStatusColor: Color {
-        guard locationKeepAlive.isEnabled else { return .secondary }
+        if locationKeepAlive.mode == .apnsBatterySaver {
+            return .green
+        }
+        if locationKeepAlive.isPausedForLowPower {
+            return .orange
+        }
         switch locationKeepAlive.authorizationStatus {
         case .authorizedAlways:
             return .green
@@ -88,6 +96,12 @@ struct SettingsView: View {
                         } label: {
                             Label("Şimdi Yeniden Bağlan (LAN Taraması)", systemImage: "arrow.triangle.2.circlepath")
                         }
+                        Button {
+                            SimHaptics.tap(.medium)
+                            bridge.resetConnectionCleanly()
+                        } label: {
+                            Label("Bağlantıyı Sıfırla (Tam Yenileme)", systemImage: "bolt.horizontal.circle")
+                        }
                     }
                     Button {
                         showingScanner = true
@@ -104,6 +118,16 @@ struct SettingsView: View {
                                 .foregroundStyle(
                                     st.isCharging ? .green : (st.batteryPct <= 15 ? .red : (st.batteryPct <= 25 ? .orange : .secondary))
                                 )
+                        }
+                        if st.powerSaveMode == true {
+                            LabeledContent("Android Pil Tasarrufu") {
+                                Label("Açık (Uyku etkileyebilir)", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.orange)
+                            }
+                        }
+                        if let apnsSummary = st.lastApnsSummary, !apnsSummary.isEmpty {
+                            LabeledContent("Son APNs Push", value: apnsSummary)
                         }
                         LabeledContent("Priv-App Ses Yetkisi", value: st.isPrivileged ? "Aktif ✓" : "Eksik ✕")
                         LabeledContent("InCallService", value: st.inCallServiceBound ? "Bağlı ✓" : "Arama Bekleniyor")
@@ -149,19 +173,55 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("iOS Entegrasyon & Arka Plan") {
-                    Toggle("Ölümsüz Arka Plan (3km Düşük Güç Konum)", isOn: $locationKeepAlive.isEnabled)
-                    Toggle("Redmi Düşük Pil Uyarısı (≤%15)", isOn: $notifications.lowBatteryAlertEnabled)
+                Section {
+                    Picker("Arka Plan Modu", selection: $locationKeepAlive.mode) {
+                        ForEach(BackgroundKeepAliveMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: locationKeepAlive.mode) { newMode in
+                        if newMode == .continuousLan {
+                            locationKeepAlive.promptIfNotDetermined()
+                        }
+                    }
+
+                    if locationKeepAlive.mode == .continuousLan {
+                        Toggle("Düşük Güç Modu'nda Hafif Moda Geç", isOn: $locationKeepAlive.autoPauseInLowPowerMode)
+                    }
+
+                    LabeledContent("iPhone Düşük Güç Modu") {
+                        Text(locationKeepAlive.isLowPowerModeEnabled ? "Açık" : "Kapalı")
+                            .foregroundStyle(locationKeepAlive.isLowPowerModeEnabled ? .orange : .secondary)
+                    }
+
                     LabeledContent("Konum Keep-Alive") {
                         Text(locationStatusLabel)
                             .foregroundStyle(locationStatusColor)
                     }
-                    if locationKeepAlive.isEnabled && locationKeepAlive.authorizationStatus != .authorizedAlways {
+
+                    if locationKeepAlive.mode == .continuousLan && locationKeepAlive.authorizationStatus != .authorizedAlways {
                         Button("Konum İznini 'Her Zaman' Yap (Mavi Barı Gizle)") {
                             locationKeepAlive.requestAlwaysPermission()
                         }
                         .foregroundStyle(.orange)
                     }
+
+                    if let wakeAt = locationKeepAlive.lastBackgroundWakeAt {
+                        LabeledContent("Son Arka Plan Uyanışı") {
+                            HStack(spacing: 4) {
+                                if let src = locationKeepAlive.lastBackgroundWakeSource, !src.isEmpty {
+                                    Text(src)
+                                    Text("•")
+                                }
+                                Text(wakeAt, style: .time)
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Toggle("Redmi Düşük Pil Uyarısı (≤%15)", isOn: $notifications.lowBatteryAlertEnabled)
                     LabeledContent("Arka Planda Yenile", value: backgroundRefreshLabel)
                     if UIApplication.shared.backgroundRefreshStatus == .denied {
                         Button("Arka Planda Yenilemeyi Aç") {
@@ -173,6 +233,10 @@ struct SettingsView: View {
                     LabeledContent("Varsayılan Arama", value: "Ayarlar > Uygulamalar > Saptanmış > Arama")
                     LabeledContent("CallKit & Kişiler", value: "Aktif (Ara'ya basılı tut → SimBridge)")
                     LabeledContent("Siri & tel:// Bağlantıları", value: "Destekleniyor ✓")
+                } header: {
+                    Text("iOS Entegrasyon & Arka Plan")
+                } footer: {
+                    Text("Pil Dostu (APNs) minimum pil tüketir; gelen aramalar VoIP PushKit, SMS'ler APNs ile uyanır. 7/24 Aktif LAN sürekli konum güncellemesiyle yerel soketi canlı tutar ancak iPhone pil tüketimini artırır.")
                 }
 
                 Section("Ses & Hoparlör") {

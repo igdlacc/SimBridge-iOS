@@ -2,42 +2,117 @@ import CoreLocation
 import Foundation
 import UIKit
 
+enum BackgroundKeepAliveMode: String, CaseIterable, Identifiable {
+    case apnsBatterySaver
+    case continuousLan
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .apnsBatterySaver:
+            return "Pil Dostu (APNs)"
+        case .continuousLan:
+            return "7/24 Aktif LAN"
+        }
+    }
+}
+
 @MainActor
 final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationManagerDelegate {
     static let shared = LocationKeepAliveManager()
 
-    private static let enabledKey = "simbridge.location.keepalive.enabled"
+    private static let modeKey = "simbridge.location.keepalive.mode"
+    private static let autoPauseLowPowerKey = "simbridge.location.keepalive.autoPauseLowPower"
+    private static let lastWakeAtKey = "simbridge.location.keepalive.lastWakeAt"
+    private static let lastWakeSourceKey = "simbridge.location.keepalive.lastWakeSource"
     private static let requestedAlwaysOnceKey = "simbridge.location.requestedAlwaysOnce"
 
-    @Published var isEnabled: Bool {
+    @Published var mode: BackgroundKeepAliveMode {
         didSet {
-            UserDefaults.standard.set(isEnabled, forKey: Self.enabledKey)
+            UserDefaults.standard.set(mode.rawValue, forKey: Self.modeKey)
             applyState()
         }
     }
 
+    @Published var autoPauseInLowPowerMode: Bool {
+        didSet {
+            UserDefaults.standard.set(autoPauseInLowPowerMode, forKey: Self.autoPauseLowPowerKey)
+            applyState()
+        }
+    }
+
+    @Published private(set) var isLowPowerModeEnabled: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled
+    @Published private(set) var isPausedForLowPower: Bool = false
+    @Published private(set) var lastBackgroundWakeAt: Date?
+    @Published private(set) var lastBackgroundWakeSource: String?
     @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published private(set) var isRunning: Bool = false
 
+    var isEnabled: Bool {
+        mode == .continuousLan
+    }
+
     private let manager = CLLocationManager()
     private var backgroundTickTimer: DispatchSourceTimer?
+    private var backgroundActivitySession: AnyObject?
+    private var powerStateObserver: NSObjectProtocol?
     private var lastLocationRestartAt: Date = Date()
 
     private override init() {
-        if UserDefaults.standard.object(forKey: Self.enabledKey) == nil {
-            self.isEnabled = true
-            UserDefaults.standard.set(true, forKey: Self.enabledKey)
+        if let rawMode = UserDefaults.standard.string(forKey: Self.modeKey),
+           let parsedMode = BackgroundKeepAliveMode(rawValue: rawMode) {
+            self.mode = parsedMode
         } else {
-            self.isEnabled = UserDefaults.standard.bool(forKey: Self.enabledKey)
+            self.mode = .apnsBatterySaver
+            UserDefaults.standard.set(BackgroundKeepAliveMode.apnsBatterySaver.rawValue, forKey: Self.modeKey)
         }
+
+        if UserDefaults.standard.object(forKey: Self.autoPauseLowPowerKey) == nil {
+            self.autoPauseInLowPowerMode = true
+            UserDefaults.standard.set(true, forKey: Self.autoPauseLowPowerKey)
+        } else {
+            self.autoPauseInLowPowerMode = UserDefaults.standard.bool(forKey: Self.autoPauseLowPowerKey)
+        }
+
+        if let savedWakeTs = UserDefaults.standard.object(forKey: Self.lastWakeAtKey) as? TimeInterval,
+           savedWakeTs > 0 {
+            self.lastBackgroundWakeAt = Date(timeIntervalSince1970: savedWakeTs)
+        } else {
+            self.lastBackgroundWakeAt = nil
+        }
+        self.lastBackgroundWakeSource = UserDefaults.standard.string(forKey: Self.lastWakeSourceKey)
+
         super.init()
         manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
         // Strictly kCLDistanceFilterNone so iOS 16.4+ locationd never treats the background session as idle.
         manager.distanceFilter = kCLDistanceFilterNone
         manager.pausesLocationUpdatesAutomatically = false
         manager.activityType = .other
         authorizationStatus = manager.authorizationStatus
+        isPausedForLowPower = (mode == .continuousLan) && autoPauseInLowPowerMode && isLowPowerModeEnabled
+
+        powerStateObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name.NSProcessInfoPowerStateDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
+                self.applyState()
+            }
+        }
+    }
+
+    @MainActor
+    func recordBackgroundWake(source: String) {
+        let now = Date()
+        lastBackgroundWakeAt = now
+        lastBackgroundWakeSource = source
+        UserDefaults.standard.set(now.timeIntervalSince1970, forKey: Self.lastWakeAtKey)
+        UserDefaults.standard.set(source, forKey: Self.lastWakeSourceKey)
     }
 
     func startIfAuthorized() {
@@ -52,7 +127,7 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
 
     func promptIfNotDetermined() {
         authorizationStatus = manager.authorizationStatus
-        if isEnabled && authorizationStatus == .notDetermined {
+        if mode == .continuousLan && authorizationStatus == .notDetermined {
             manager.requestWhenInUseAuthorization()
         }
     }
@@ -85,9 +160,11 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
         let authorized = (authorizationStatus == .authorizedAlways || authorizationStatus == .authorizedWhenInUse)
         let hasLocationMode = (Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String])?
             .contains("location") == true
+        let wantContinuous = (mode == .continuousLan) && !(autoPauseInLowPowerMode && isLowPowerModeEnabled)
+        isPausedForLowPower = (mode == .continuousLan) && autoPauseInLowPowerMode && isLowPowerModeEnabled
 
-        if isEnabled && authorized {
-            manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        if wantContinuous && authorized {
+            manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
             manager.distanceFilter = kCLDistanceFilterNone
             manager.pausesLocationUpdatesAutomatically = false
             manager.activityType = .other
@@ -96,6 +173,11 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
             }
             // With "Her Zaman" (Always), hides blue status pill / Dynamic Island indicator completely.
             manager.showsBackgroundLocationIndicator = false
+            if #available(iOS 17.0, *) {
+                if backgroundActivitySession == nil {
+                    backgroundActivitySession = CLBackgroundActivitySession()
+                }
+            }
             lastLocationRestartAt = Date()
             manager.startUpdatingLocation()
             if CLLocationManager.significantLocationChangeMonitoringAvailable() {
@@ -104,10 +186,21 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
             startBackgroundTickTimer()
             isRunning = true
         } else {
+            if #available(iOS 17.0, *) {
+                (backgroundActivitySession as? CLBackgroundActivitySession)?.invalidate()
+            }
+            backgroundActivitySession = nil
             stopBackgroundTickTimer()
             manager.stopUpdatingLocation()
+            if hasLocationMode {
+                manager.allowsBackgroundLocationUpdates = false
+            }
             if CLLocationManager.significantLocationChangeMonitoringAvailable() {
-                manager.stopMonitoringSignificantLocationChanges()
+                if authorized {
+                    manager.startMonitoringSignificantLocationChanges()
+                } else {
+                    manager.stopMonitoringSignificantLocationChanges()
+                }
             }
             isRunning = false
         }
@@ -145,7 +238,7 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
             self.authorizationStatus = status
             self.applyState()
             if status == .authorizedWhenInUse,
-               self.isEnabled,
+               self.mode == .continuousLan,
                !UserDefaults.standard.bool(forKey: Self.requestedAlwaysOnceKey) {
                 UserDefaults.standard.set(true, forKey: Self.requestedAlwaysOnceKey)
                 self.manager.requestAlwaysAuthorization()
@@ -154,8 +247,10 @@ final class LocationKeepAliveManager: NSObject, ObservableObject, CLLocationMana
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self else { return }
             if UIApplication.shared.applicationState != .active {
+                self.recordBackgroundWake(source: self.isRunning ? "Aktif Konum" : "Anlamlı Konum")
                 BridgeClient.shared.onBackgroundLocationTick()
             }
         }

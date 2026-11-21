@@ -70,6 +70,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
             completeTask(false)
         }
         Task { @MainActor in
+            LocationKeepAliveManager.shared.recordBackgroundWake(source: "BGAppRefresh")
             BridgeClient.shared.performBackgroundRefresh { success in
                 completeTask(success)
             }
@@ -81,6 +82,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         performFetchWithCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         Task { @MainActor in
+            LocationKeepAliveManager.shared.recordBackgroundWake(source: "BackgroundFetch")
             BridgeClient.shared.performBackgroundRefresh { ok in
                 completionHandler(ok ? .newData : .noData)
             }
@@ -93,6 +95,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         Task { @MainActor in
+            LocationKeepAliveManager.shared.recordBackgroundWake(source: "APNs Push")
             BridgeClient.shared.performBackgroundRefresh { ok in
                 completionHandler(ok ? .newData : .noData)
             }
@@ -308,6 +311,9 @@ struct MainTabView: View {
             }
         }
         .onAppear {
+            if UIApplication.shared.applicationState == .active {
+                BridgeClient.shared.setAppForegroundState(true)
+            }
             UNUserNotificationCenter.current().setBadgeCount(unreadSmsCount, withCompletionHandler: nil)
         }
         .onChange(of: unreadSmsCount) { count in

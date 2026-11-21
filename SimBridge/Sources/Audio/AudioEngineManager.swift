@@ -676,6 +676,45 @@ final class AudioEngineManager: ObservableObject {
         stateLock.unlock()
     }
 
+    var isSessionRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isRunning
+    }
+
+    func needsCallAudioRecovery() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return !isRunning || isInterrupted || (engine?.isRunning != true)
+    }
+
+    func triggerRecoveryIfNeeded(reason: String) {
+        stateLock.lock()
+        if isRunning && (isInterrupted || engine?.isRunning != true) {
+            recordDiagnostic("triggerRecoveryIfNeeded(\(reason))")
+            scheduleRecoveryLocked(delayMs: 80, allowHoldBounce: true, reason: reason, fromProbe: false)
+        }
+        stateLock.unlock()
+    }
+
+    func forceRecoverActiveCall() {
+        stateLock.lock()
+        guard isRunning else {
+            stateLock.unlock()
+            return
+        }
+        recordDiagnostic("forceRecoverActiveCall")
+        holdBounceAttemptedInEpisode = false
+        probeAttemptCount = 0
+        isInterrupted = true
+        recoveryGeneration &+= 1
+        teardownEngineLocked()
+        converter = nil
+        lastInputFormat = nil
+        scheduleRecoveryLocked(delayMs: 60, allowHoldBounce: true, reason: "manual_refresh", fromProbe: false)
+        stateLock.unlock()
+    }
+
     func setMuted(_ muted: Bool) {
         stateLock.lock()
         isMutedLocked = muted

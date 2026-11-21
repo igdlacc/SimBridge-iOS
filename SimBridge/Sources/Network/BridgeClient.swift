@@ -279,6 +279,9 @@ final class BridgeClient: ObservableObject {
 
     private var cachedVoipToken: String?
     private var cachedAlertToken: String?
+    private weak var lastHelloTask: URLSessionWebSocketTask?
+    private var lastHelloVoipToken: String?
+    private var lastHelloAlertToken: String?
     private var isConnecting = false
     private(set) var isAppInForeground: Bool = true
     private var lastPongAt: Date = Date()
@@ -288,6 +291,10 @@ final class BridgeClient: ObservableObject {
     private var retryAttemptCount = 0
     private var lastAttemptedIps: Set<String> = []
     private var localReadTimestamps: [String: Int64] = [:]
+    private var optimisticOutgoingCreatedAt: [String: Date] = [:]
+    private var serverConfirmedCallIds: Set<String> = []
+    private var foregroundObserver: NSObjectProtocol?
+    private var backgroundObserver: NSObjectProtocol?
     private var voipBgTask: UIBackgroundTaskIdentifier = .invalid
     private var voipBgTimer: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
@@ -305,6 +312,26 @@ final class BridgeClient: ObservableObject {
         cfg.timeoutIntervalForRequest = 120
         urlSession = URLSession(configuration: cfg)
         isAppInForeground = (UIApplication.shared.applicationState != .background)
+
+        let nc = NotificationCenter.default
+        foregroundObserver = nc.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.setAppForegroundState(true)
+            }
+        }
+        backgroundObserver = nc.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.setAppForegroundState(false)
+            }
+        }
 
         startNetworkMonitor()
 
@@ -350,6 +377,11 @@ final class BridgeClient: ObservableObject {
         retryAttemptCount = 0
         lastAttemptedIps = []
         localReadTimestamps = [:]
+        optimisticOutgoingCreatedAt = [:]
+        serverConfirmedCallIds = []
+        lastHelloTask = nil
+        lastHelloVoipToken = nil
+        lastHelloAlertToken = nil
         PairingStore.shared.clear()
         clearEncryptedCache()
         isPaired = false
@@ -385,11 +417,48 @@ final class BridgeClient: ObservableObject {
         return sims.first?.simSlot ?? 0
     }
 
+    func registerOptimisticOutgoingCall(callId: String, number: String, contactName: String?, simSlot: Int) {
+        let now = Date()
+        optimisticOutgoingCreatedAt[callId] = now
+        if !activeCalls.contains(where: { $0.callId == callId }) {
+            let dto = CallStateDto(
+                callId: callId,
+                number: number,
+                contactName: contactName,
+                direction: "outgoing",
+                state: "dialing",
+                simSlot: simSlot,
+                startedAtMs: Int64(now.timeIntervalSince1970 * 1000),
+                connectedAtMs: 0,
+                disconnectReason: nil,
+                muted: false,
+                onHold: false,
+                audioActive: false,
+                callHash: BridgeCrypto.fnv1a32(callId)
+            )
+            activeCalls.append(dto)
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 8_600_000_000)
+            guard let self,
+                  !self.serverConfirmedCallIds.contains(callId),
+                  self.optimisticOutgoingCreatedAt[callId] == now else {
+                return
+            }
+            self.optimisticOutgoingCreatedAt.removeValue(forKey: callId)
+            self.activeCalls.removeAll { $0.callId == callId }
+        }
+    }
+
     func handleLocalCallEnded(callId: String?) {
         if let callId {
             activeCalls.removeAll { $0.callId == callId }
+            optimisticOutgoingCreatedAt.removeValue(forKey: callId)
+            serverConfirmedCallIds.remove(callId)
         } else {
             activeCalls.removeAll()
+            optimisticOutgoingCreatedAt.removeAll()
+            serverConfirmedCallIds.removeAll()
         }
     }
 
@@ -543,7 +612,9 @@ final class BridgeClient: ObservableObject {
     func updatePushTokens(voipToken: String? = nil, alertToken: String? = nil) {
         if let voipToken, !voipToken.isEmpty { cachedVoipToken = voipToken }
         if let alertToken, !alertToken.isEmpty { cachedAlertToken = alertToken }
-        if isConnected {
+        if isConnected,
+           let task = wsTask,
+           (lastHelloTask !== task || cachedVoipToken != lastHelloVoipToken || cachedAlertToken != lastHelloAlertToken) {
             sendHello()
         }
     }
@@ -574,7 +645,19 @@ final class BridgeClient: ObservableObject {
                 await self.refreshSync()
             }
             if self.isConnected {
-                VoipPushManager.shared.resendTokensIfAvailable()
+                let voip = VoipPushManager.shared.currentVoipTokenHex
+                let alert = NotificationManager.shared.currentAlertTokenHex
+                let voipCandidate = voip.isEmpty ? self.cachedVoipToken : voip
+                let alertCandidate = alert.isEmpty ? self.cachedAlertToken : alert
+                let tokensAlreadySent = (
+                    self.wsTask != nil &&
+                    self.lastHelloTask === self.wsTask &&
+                    voipCandidate == self.lastHelloVoipToken &&
+                    alertCandidate == self.lastHelloAlertToken
+                )
+                if !tokensAlreadySent {
+                    VoipPushManager.shared.resendTokensIfAvailable()
+                }
                 try? await Task.sleep(nanoseconds: 800_000_000)
                 finish(true)
             } else {
@@ -643,11 +726,22 @@ final class BridgeClient: ObservableObject {
         endVoipWakeBackgroundTask()
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
+        lastHelloTask = nil
         udpTransport.stop()
         keepaliveTimer?.cancel()
         keepaliveTimer = nil
         pingLatencyMs = nil
         isConnected = false
+    }
+
+    func resetConnectionCleanly() {
+        disconnect()
+        retryAttemptCount = 0
+        lastAttemptedIps = []
+        guard isPaired else { return }
+        statusBanner = "Bağlantı sıfırlanıyor..."
+        startDiscovery()
+        connectNow(force: true, sweepSubnet: true)
     }
 
     func reportUiError(_ message: String) {
@@ -787,10 +881,12 @@ final class BridgeClient: ObservableObject {
             connectNow(force: true, sweepSubnet: true)
             return
         }
-        // Probe sockets that iOS silently tore down while suspended in background (1.2s bounded timeout).
+        // Probe sockets that iOS silently tore down while suspended in background (350ms/800ms bounded timeout).
+        let staleAge = now.timeIntervalSince(lastPongAt)
+        let probeTimeoutNs: UInt64 = staleAge > 60.0 ? 350_000_000 : 800_000_000
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let alive = await self.probeNativeWsPing(task: task, timeoutNs: 1_200_000_000)
+            let alive = await self.probeNativeWsPing(task: task, timeoutNs: probeTimeoutNs)
             if !alive {
                 if self.wsTask === task {
                     task.cancel(with: .goingAway, reason: nil)
@@ -939,11 +1035,17 @@ final class BridgeClient: ObservableObject {
     }
 
     private func sendHello() {
+        guard let task = wsTask else { return }
+        let voip = cachedVoipToken
+        let alert = cachedAlertToken
+        lastHelloTask = task
+        lastHelloVoipToken = voip
+        lastHelloAlertToken = alert
         sendCommand(
             BridgeWsMessage(
                 type: "hello",
-                voipToken: cachedVoipToken,
-                alertToken: cachedAlertToken,
+                voipToken: voip,
+                alertToken: alert,
                 clientName: UIDevice.current.name,
                 clientForeground: isAppInForeground
             )
@@ -1098,10 +1200,12 @@ final class BridgeClient: ObservableObject {
         wsTask = nil
         isConnected = false
 
+        let helloVoipToken = cachedVoipToken
+        let helloAlertToken = cachedAlertToken
         let hello = BridgeWsMessage(
             type: "hello",
-            voipToken: cachedVoipToken,
-            alertToken: cachedAlertToken,
+            voipToken: helloVoipToken,
+            alertToken: helloAlertToken,
             clientName: UIDevice.current.name,
             clientForeground: isAppInForeground
         )
@@ -1185,11 +1289,17 @@ final class BridgeClient: ObservableObject {
         if let win = winner {
             self.retryAttemptCount = 0
             self.wsTask = win.task
+            self.lastHelloTask = win.task
+            self.lastHelloVoipToken = helloVoipToken
+            self.lastHelloAlertToken = helloAlertToken
             self.isConnected = true
             self.lastPongAt = Date()
             self.connectedHost = win.ip
             self.statusBanner = "Bağlı (\(win.ip))"
             PairingStore.shared.updateIps([win.ip], lastWorkingIp: win.ip, wsPort: win.wsPort, udpPort: win.udpPort)
+            if self.cachedVoipToken != self.lastHelloVoipToken || self.cachedAlertToken != self.lastHelloAlertToken {
+                self.sendHello()
+            }
             await self.handleWebSocketMessage(win.firstMsg, key: key)
             if let liveCid = CallKitManager.shared.currentActiveAudioCallId
                 ?? self.activeCalls.first(where: { $0.state == "active" || $0.state == "dialing" })?.callId {
@@ -1269,7 +1379,21 @@ final class BridgeClient: ObservableObject {
         case "snapshot":
             lastSyncAt = Date()
             if let calls = wsMsg.activeCalls {
-                activeCalls = calls
+                let now = Date()
+                let serverIds = Set(calls.map(\.callId))
+                serverConfirmedCallIds = serverIds
+                var merged = calls
+                for localCall in activeCalls where !serverIds.contains(localCall.callId) {
+                    if let createdAt = optimisticOutgoingCreatedAt[localCall.callId],
+                       now.timeIntervalSince(createdAt) < 8.5,
+                       CallKitManager.shared.isCallTracked(callId: localCall.callId) {
+                        merged.append(localCall)
+                    }
+                }
+                optimisticOutgoingCreatedAt = optimisticOutgoingCreatedAt.filter { _, createdAt in
+                    now.timeIntervalSince(createdAt) < 8.5
+                }
+                activeCalls = merged
                 CallKitManager.shared.reconcileActiveCalls(calls)
             }
             if let recents = wsMsg.recentCalls { recentCalls = recents }
@@ -1306,8 +1430,11 @@ final class BridgeClient: ObservableObject {
                 CallKitManager.shared.handleRemoteCallState(c)
                 if c.state == "disconnected" {
                     activeCalls.removeAll { $0.callId == c.callId }
+                    optimisticOutgoingCreatedAt.removeValue(forKey: c.callId)
+                    serverConfirmedCallIds.remove(c.callId)
                     sendCommand(BridgeWsMessage(type: "sync_request"))
                 } else {
+                    serverConfirmedCallIds.insert(c.callId)
                     if let idx = activeCalls.firstIndex(where: { $0.callId == c.callId }) {
                         activeCalls[idx] = c
                     } else {
@@ -1570,7 +1697,7 @@ final class BridgeClient: ObservableObject {
                         guard let self, self.isPaired else { return }
                         let portArg = resolvedPort > 0 ? resolvedPort : nil
                         PairingStore.shared.updateIps([ip], wsPort: portArg)
-                        if !self.isConnected {
+                        if !self.isConnected && !self.isConnecting {
                             self.connectNow(candidateIps: [ip], wsPort: portArg)
                         }
                     }

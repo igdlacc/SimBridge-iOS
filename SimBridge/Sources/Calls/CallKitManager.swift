@@ -24,12 +24,19 @@ final class CallKitManager: NSObject, CXProviderDelegate {
     private var userHeldCallUuids: Set<UUID> = []
     private var internalHoldBounceUuids: Set<UUID> = []
     private var remoteHoldSyncUuids: Set<UUID> = []
+    private var audioWatchdogTasks: [UUID: Task<Void, Never>] = [:]
     private var lastHoldBounceAt: Date = .distantPast
 
     var currentActiveAudioCallId: String? {
         lock.lock()
         defer { lock.unlock() }
         return activeAudioCallId
+    }
+
+    func isCallTracked(callId: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return uuidByCallId[callId] != nil
     }
 
     #if compiler(>=6.2)
@@ -341,6 +348,9 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                     lock.unlock()
                     callController.request(CXTransaction(action: CXSetHeldCallAction(call: uuid, onHold: false))) { _ in }
                 }
+                if !dto.onHold {
+                    scheduleAudioActivationWatchdog(uuid: uuid, callId: dto.callId)
+                }
             }
             if AudioEngineManager.shared.isMuted != dto.muted {
                 AudioEngineManager.shared.setMuted(dto.muted)
@@ -576,6 +586,111 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         return true
     }
 
+    private func scheduleAudioActivationWatchdog(uuid: UUID, callId: String) {
+        _ = callId
+        let task = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard !Task.isCancelled, let self else { return }
+
+            self.lock.lock()
+            let cid = self.callIdByUuid[uuid]
+            let isHeldByUser = self.userHeldCallUuids.contains(uuid)
+            let isBouncing = self.internalHoldBounceUuids.contains(uuid)
+            self.audioWatchdogTasks.removeValue(forKey: uuid)
+            self.lock.unlock()
+
+            guard let cid, !isHeldByUser, !isBouncing, !self.hasExternalActiveCall() else {
+                return
+            }
+
+            let audio = AudioEngineManager.shared
+            guard audio.needsCallAudioRecovery() else { return }
+
+            let wasRunning = audio.isSessionRunning
+            audio.recordDiagnostic("CallKit audio watchdog triggered callId=\(cid) running=\(wasRunning)")
+
+            await MainActor.run {
+                BridgeClient.shared.startUdpSession(callId: cid)
+            }
+
+            if !wasRunning {
+                let session = AVAudioSession.sharedInstance()
+                self.configureAudioSession(on: session, source: "watchdog")
+                do {
+                    try session.setActive(true)
+                    if !session.currentRoute.inputs.isEmpty {
+                        audio.start(callId: cid) { encoded, seq, ts, callHash in
+                            BridgeClient.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
+                        }
+                    } else {
+                        audio.recordDiagnostic("watchdog setActive ok but inputs empty")
+                        if !self.reclaimAudioActivationIfNeeded(source: "watchdog") {
+                            audio.start(callId: cid) { encoded, seq, ts, callHash in
+                                BridgeClient.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
+                            }
+                        }
+                    }
+                } catch {
+                    let nsErr = error as NSError
+                    audio.recordDiagnostic("watchdog setActive ERR domain=\(nsErr.domain) code=\(nsErr.code)")
+                    _ = self.reclaimAudioActivationIfNeeded(source: "watchdog")
+                }
+            } else {
+                audio.triggerRecoveryIfNeeded(reason: "watchdog_2_5s")
+            }
+        }
+
+        lock.lock()
+        audioWatchdogTasks[uuid]?.cancel()
+        audioWatchdogTasks[uuid] = task
+        lock.unlock()
+    }
+
+    func forceRefreshCallAudio() {
+        lock.lock()
+        let resolvedCid = activeAudioCallId ?? callIdByUuid.values.first
+        let resolvedUuid = resolvedCid.flatMap { uuidByCallId[$0] } ?? callIdByUuid.keys.first
+        lock.unlock()
+
+        guard let cid = resolvedCid, resolvedUuid != nil else {
+            AudioEngineManager.shared.recordDiagnostic("forceRefreshCallAudio skipped: no active call")
+            return
+        }
+
+        let audio = AudioEngineManager.shared
+        audio.recordDiagnostic("forceRefreshCallAudio callId=\(cid) running=\(audio.isSessionRunning)")
+        Task { @MainActor in
+            BridgeClient.shared.stopUdpSession()
+            BridgeClient.shared.startUdpSession(callId: cid)
+        }
+
+        if audio.isSessionRunning {
+            audio.forceRecoverActiveCall()
+        } else {
+            guard !hasExternalActiveCall() else {
+                audio.recordDiagnostic("forceRefreshCallAudio skipped: external call active")
+                return
+            }
+            let session = AVAudioSession.sharedInstance()
+            configureAudioSession(on: session, source: "manual_refresh")
+            do {
+                try session.setActive(true)
+                if !session.currentRoute.inputs.isEmpty {
+                    audio.start(callId: cid) { encoded, seq, ts, callHash in
+                        BridgeClient.sendOpusFrame(encoded: encoded, seq: seq, ts: ts, callHash: callHash)
+                    }
+                } else {
+                    audio.recordDiagnostic("manual_refresh setActive ok but inputs empty")
+                    _ = reclaimAudioActivationIfNeeded(source: "manual_refresh")
+                }
+            } catch {
+                let nsErr = error as NSError
+                audio.recordDiagnostic("manual_refresh setActive ERR domain=\(nsErr.domain) code=\(nsErr.code)")
+                _ = reclaimAudioActivationIfNeeded(source: "manual_refresh")
+            }
+        }
+    }
+
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
         configureAudioSession(source: "start_action")
         lock.lock()
@@ -600,6 +715,12 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         provider.reportCall(with: action.callUUID, updated: update)
 
         Task { @MainActor in
+            BridgeClient.shared.registerOptimisticOutgoingCall(
+                callId: cid,
+                number: number,
+                contactName: contactName,
+                simSlot: simSlot
+            )
             let msg = BridgeWsMessage(type: "place_call", callId: cid, number: number, simSlot: simSlot)
             BridgeClient.shared.sendPlaceCall(msg) { ok in
                 if ok {
@@ -610,6 +731,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                 }
             }
         }
+        scheduleAudioActivationWatchdog(uuid: action.callUUID, callId: cid)
     }
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
@@ -632,6 +754,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
                     AudioEngineManager.shared.recordDiagnostic("answer_call reliable send timed out")
                 }
             }
+            scheduleAudioActivationWatchdog(uuid: action.callUUID, callId: callId)
         }
         action.fulfill()
     }
@@ -852,6 +975,7 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         userHeldCallUuids.remove(uuid)
         internalHoldBounceUuids.remove(uuid)
         remoteHoldSyncUuids.remove(uuid)
+        audioWatchdogTasks.removeValue(forKey: uuid)?.cancel()
         if pendingOutgoingUuid == uuid { pendingOutgoingUuid = nil }
         lock.unlock()
     }
@@ -869,6 +993,10 @@ final class CallKitManager: NSObject, CXProviderDelegate {
         userHeldCallUuids.removeAll()
         internalHoldBounceUuids.removeAll()
         remoteHoldSyncUuids.removeAll()
+        for task in audioWatchdogTasks.values {
+            task.cancel()
+        }
+        audioWatchdogTasks.removeAll()
         pendingOutgoingUuid = nil
         activeAudioCallId = nil
     }

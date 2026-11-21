@@ -88,6 +88,7 @@ final class VoipPushManager: NSObject, ObservableObject, PKPushRegistryDelegate 
         }
 
         Task { @MainActor in
+            LocationKeepAliveManager.shared.recordBackgroundWake(source: "VoIP Push")
             BridgeClient.shared.handleIncomingVoipPushWake(candidateIps: ips, wsPort: wsPort, udpPort: udpPort)
         }
     }
