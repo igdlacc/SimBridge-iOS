@@ -1385,13 +1385,13 @@ final class BridgeClient: ObservableObject {
                 var merged = calls
                 for localCall in activeCalls where !serverIds.contains(localCall.callId) {
                     if let createdAt = optimisticOutgoingCreatedAt[localCall.callId],
-                       now.timeIntervalSince(createdAt) < 8.5,
+                       now.timeIntervalSince(createdAt) < 12.0,
                        CallKitManager.shared.isCallTracked(callId: localCall.callId) {
                         merged.append(localCall)
                     }
                 }
                 optimisticOutgoingCreatedAt = optimisticOutgoingCreatedAt.filter { _, createdAt in
-                    now.timeIntervalSince(createdAt) < 8.5
+                    now.timeIntervalSince(createdAt) < 12.0
                 }
                 activeCalls = merged
                 CallKitManager.shared.reconcileActiveCalls(calls)
