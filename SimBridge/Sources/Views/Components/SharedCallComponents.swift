@@ -52,65 +52,134 @@ struct AvatarCircle: View {
     }
 }
 
+struct SignalBarsView: View {
+    let level: Int
+    var outOfService: Bool = false
+
+    private var clampedLevel: Int {
+        outOfService ? 0 : min(max(level, 0), 4)
+    }
+
+    private var activeColor: Color {
+        if outOfService || clampedLevel == 0 { return .red }
+        if clampedLevel == 1 { return .orange }
+        return .primary
+    }
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 1.8) {
+            ForEach(0..<4, id: \.self) { idx in
+                let filled = idx < clampedLevel
+                RoundedRectangle(cornerRadius: 0.9)
+                    .fill(filled ? activeColor : Color.secondary.opacity(0.28))
+                    .frame(width: 2.8, height: CGFloat(5 + idx * 3))
+            }
+        }
+        .frame(height: 14, alignment: .bottom)
+        .accessibilityLabel(outOfService ? "Şebeke yok" : "Sinyal \(clampedLevel)/4")
+    }
+}
+
 struct ConnectionStatusPill: View {
     @ObservedObject private var bridge = BridgeClient.shared
     @ObservedObject private var locationKeepAlive = LocationKeepAliveManager.shared
+    @AppStorage("simbridge.preferredSimSlot") private var preferredSimSlot: Int = 0
+
+    private var activeSim: SimSlotDto? {
+        let sims = bridge.deviceStatus?.sims ?? []
+        guard !sims.isEmpty else { return nil }
+        return sims.first(where: { $0.simSlot == preferredSimSlot }) ?? sims.first
+    }
+
+    private var showCellularRow: Bool {
+        guard bridge.isConnected, let sim = activeSim else { return false }
+        return sim.signalLevel != nil || (sim.networkType?.isEmpty == false)
+    }
 
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(dotColor)
-                .frame(width: 9, height: 9)
+        VStack(spacing: 5) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(dotColor)
+                    .frame(width: 9, height: 9)
 
-            Text(bridge.statusBanner)
-                .font(.caption.weight(.medium))
-                .lineLimit(1)
-
-            if bridge.isConnected, let rtt = bridge.pingLatencyMs {
-                Text("\(rtt) ms")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color(.tertiarySystemBackground))
-                    .clipShape(Capsule())
-            }
-
-            if locationKeepAlive.isLowPowerModeEnabled || (bridge.deviceStatus?.powerSaveMode == true) {
-                Text("Düşük Güç")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.orange)
+                Text(bridge.statusBanner)
+                    .font(.caption.weight(.medium))
                     .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange.opacity(0.16))
-                    .clipShape(Capsule())
-            }
 
-            Spacer(minLength: 4)
-
-            if bridge.isPaired && !bridge.isConnected {
-                Image(systemName: "arrow.clockwise")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.orange)
-            }
-
-            if let st = bridge.deviceStatus {
-                HStack(spacing: 3) {
-                    Image(systemName: batterySymbol(pct: st.batteryPct, charging: st.isCharging))
-                        .font(.caption2)
-                    Text("\(st.batteryPct)%")
-                        .font(.caption.monospacedDigit())
+                if bridge.isConnected, let rtt = bridge.pingLatencyMs {
+                    Text("\(rtt) ms")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color(.tertiarySystemBackground))
+                        .clipShape(Capsule())
                 }
-                .foregroundStyle(batteryColor(pct: st.batteryPct, charging: st.isCharging))
+
+                if locationKeepAlive.isLowPowerModeEnabled || (bridge.deviceStatus?.powerSaveMode == true) {
+                    Text("Düşük Güç")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.orange.opacity(0.16))
+                        .clipShape(Capsule())
+                }
+
+                Spacer(minLength: 4)
+
+                if bridge.isPaired && !bridge.isConnected {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+
+                if let st = bridge.deviceStatus {
+                    HStack(spacing: 3) {
+                        Image(systemName: batterySymbol(pct: st.batteryPct, charging: st.isCharging))
+                            .font(.caption2)
+                        Text("\(st.batteryPct)%")
+                            .font(.caption.monospacedDigit())
+                    }
+                    .foregroundStyle(batteryColor(pct: st.batteryPct, charging: st.isCharging))
+                }
+            }
+
+            if showCellularRow, let sim = activeSim {
+                let outOfSvc = (sim.serviceState == "out_of_service" || sim.serviceState == "power_off")
+                HStack(spacing: 6) {
+                    SignalBarsView(level: sim.signalLevel ?? 0, outOfService: outOfSvc)
+
+                    let simPrefix = (bridge.deviceStatus?.sims.count ?? 0) > 1 ? "SIM \(sim.simSlot + 1) • " : ""
+                    Text("\(simPrefix)\(sim.carrierName)")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+
+                    if let net = sim.networkType, !net.isEmpty {
+                        statusBadge(net, tint: networkBadgeColor(net))
+                    }
+                    if sim.vowifiActive == true {
+                        statusBadge("VoWiFi", tint: .blue)
+                    } else if sim.volteActive == true {
+                        statusBadge("VoLTE", tint: .teal)
+                    }
+                    if sim.isRoaming == true {
+                        statusBadge("Dolaşım", tint: .orange)
+                    }
+                }
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
         .background(Color(.secondarySystemBackground))
-        .clipShape(Capsule())
-        .contentShape(Capsule())
+        .clipShape(RoundedRectangle(cornerRadius: showCellularRow ? 16 : 22, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: showCellularRow ? 16 : 22, style: .continuous))
         .onTapGesture {
             guard bridge.isPaired && !bridge.isConnected else { return }
             SimHaptics.tap(.light)
@@ -118,6 +187,29 @@ struct ConnectionStatusPill: View {
         }
         .accessibilityAddTraits(bridge.isPaired && !bridge.isConnected ? .isButton : [])
         .padding(.horizontal)
+    }
+
+    @ViewBuilder
+    private func statusBadge(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .bold))
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1.5)
+            .background(tint.opacity(0.15))
+            .clipShape(Capsule())
+    }
+
+    private func networkBadgeColor(_ net: String) -> Color {
+        switch net {
+        case "Yok", "Acil", "Kapalı": return .red
+        case "5G+", "5G": return .indigo
+        case "4G+", "LTE": return .blue
+        case "3G", "E", "2G": return .orange
+        default: return .secondary
+        }
     }
 
     private var dotColor: Color {

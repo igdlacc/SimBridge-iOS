@@ -138,7 +138,20 @@ struct SettingsView: View {
                             let valueText = (sim.phoneNumber?.isEmpty == false)
                                 ? "\(sim.carrierName) (\(sim.phoneNumber!))"
                                 : sim.carrierName
-                            LabeledContent("SIM \(sim.simSlot + 1)", value: valueText)
+                            let hasCellular = sim.signalLevel != nil || (sim.networkType?.isEmpty == false)
+                            VStack(alignment: .leading, spacing: 4) {
+                                LabeledContent("SIM \(sim.simSlot + 1)", value: valueText)
+                                if hasCellular {
+                                    let outOfSvc = (sim.serviceState == "out_of_service" || sim.serviceState == "power_off")
+                                    HStack(spacing: 6) {
+                                        SignalBarsView(level: sim.signalLevel ?? 0, outOfService: outOfSvc)
+                                        Text(simCellularSummary(sim))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -315,5 +328,25 @@ struct SettingsView: View {
         if let url = URL(string: UIApplication.openSettingsURLString) {
             UIApplication.shared.open(url)
         }
+    }
+
+    private func simCellularSummary(_ sim: SimSlotDto) -> String {
+        var parts: [String] = []
+        if let net = sim.networkType, !net.isEmpty {
+            parts.append(net)
+        }
+        if let lvl = sim.signalLevel {
+            let dbmSuffix = sim.signalDbm.map { " (\($0) dBm)" } ?? ""
+            parts.append("\(lvl)/4\(dbmSuffix)")
+        }
+        if sim.vowifiActive == true {
+            parts.append("VoWiFi")
+        } else if sim.volteActive == true {
+            parts.append("VoLTE")
+        }
+        if sim.isRoaming == true {
+            parts.append("Dolaşım")
+        }
+        return parts.joined(separator: " • ")
     }
 }

@@ -15,6 +15,13 @@ struct SimSlotDto: Codable, Identifiable, Hashable {
     let subscriptionId: Int
     let carrierName: String
     let phoneNumber: String?
+    let signalLevel: Int?
+    let signalDbm: Int?
+    let networkType: String?
+    let volteActive: Bool?
+    let vowifiActive: Bool?
+    let isRoaming: Bool?
+    let serviceState: String?
 
     var id: Int { simSlot }
 }
